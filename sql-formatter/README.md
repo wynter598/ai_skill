@@ -56,19 +56,23 @@ python3 sql_aligner.py file.sql --as-only --verify-only
 
 ## 对齐规则说明
 
-### 1. AS 关键字分级对齐
+### 1. AS 关键字对齐（与 `sql_aligner.py` 一致）
 
 **适用范围**：所有 SELECT 语句（主查询、子查询、CTE）
 
-**分级标准**：
-- 短字段组：字段长度 ≤ 50 字符
-- 中字段组：50 < 字段长度 ≤ 100 字符
-- 长字段组：字段长度 > 100 字符
+**整块统一（闸门）**：选列区逐行按「句首 ref → 列别名 `as` 前」量字符长，若极差 ≤ `SELECT_AS_UNIFY_HEAD_CHAR_SPAN_MAX`（默认 50），则该块**不分档**，所有 `as` 同一列。
+
+**分级标准**（否则；阈值对应 `SHORT_FIELD_MAX` / `MEDIUM_FIELD_MAX`）：
+- 短：`tier_len` ≤ 50
+- 中：50 < `tier_len` ≤ 100
+- 长：`tier_len` > 100  
+
+其中 **`tier_len`** 为与闸门同源的显示宽度（`_field_gate_rel_display_width`）；**组内目标列**为 `max(gate_abs_end)+AS_SPACING`（见 `skill.md` §2.2）。
 
 **对齐规则**：
 - 同组内 AS 关键字垂直对齐
 - 不同组 AS 可以在不同列
-- 短字段 AS 列 < 中字段 AS 列 < 长字段 AS 列
+- 短字段 AS 列 < 中字段 AS 列 < 长字段 AS 列（整块统一时除外）
 
 **示例**：
 ```sql
@@ -145,18 +149,12 @@ python3 sql_aligner.py file.sql --verify-only
 ### AS 对齐算法
 
 1. **字段检测**：自动检测所有 SELECT 块
-2. **字段分组**：按字段表达式长度分为短、中、长三组
-3. **字段起始位置识别**：精确计算每个字段在行中的实际起始位置
-   - SELECT 行：跳过 `select ` 关键字及后续空格
-   - 逗号前置行：跳过 `, ` 及后续空格
-   - 确保所有字段从相同的列位置开始（无论缩进是否不同）
-4. **目标计算**：每组独立计算 AS 目标列 = max(字段起始位置 + 字段长度) + 1
-   - 这确保即使字段较长，AS也能正确对齐
-   - 避免了旧算法中 `缩进 + 2` 的估算误差
+2. **整块闸门**：`select_block_unify_as_by_head_char_span` — 极差 ≤ 50 则整块单列 `as`
+3. **字段分组**（否则）：按 `tier_len`（闸门同源 ref→`as` 前显示宽）分短/中/长；无闸门宽度时回退 `field_len`（`analyze_select_block`）
+4. **字段起始与表达式**：`parse_select_field` + `align_fields_in_place` 的 `prefix`/`field_expr` 仍用于改写行内空格；**目标列**用 `max(gate_abs_end)+AS_SPACING`（`calculate_target_as_column`）
 5. **对齐执行**：调整空格使同组内 AS 精确垂直对齐
 6. **验证检查**：
-   - 同组内 AS 位置一致性
-   - 组间相对位置正确性（短 < 中 < 长）
+   - 整块统一时验全块 `as` 一列；分档时验组内一致及短/中/长相对位置
 
 ### 建表语句对齐算法
 
@@ -202,7 +200,7 @@ python3 sql_aligner.py file.sql
 
 ### Q: 如何处理包含复杂 CASE WHEN 的字段？
 
-**A**: 工具会计算整个字段表达式的长度，包括 CASE WHEN。如果字段过长（>100字符），会被归入长字段组，独立对齐。
+**A**: 分档用 **`tier_len`**（含 `as` 的那一行上，从闸门 **ref** 到列别名 `as` 前的显示宽度），不是简单手数「整条表达式 stripped 长度」。`tier_len` 很大时入长档；**跨行且 `as` 在续行**时按续行闸门宽度分档（见 `skill.md` §2.2）。整块极差 ≤50 时不分档。
 
 ### Q: 子查询的对齐规则是什么？
 
@@ -213,6 +211,7 @@ python3 sql_aligner.py file.sql
 - **v3.1** (2026-04-11) 🔧
   - 📌 与 `skill.md` 定稿对齐：**ON 一律换行**；**WHERE / HAVING** 与 **AND/OR** 列规则；**全局行首逗号**；注释 **`--` 与正文整体**等（见上文「v3.1 规范摘要」）。
   - 🐛 **工具**：`add_missing_as_keywords` 跳过含 `CASE` / `WHEN…THEN` 的行，避免误插 `then as col`；`parse_select_field` 跳过 `cast(` 未闭合内的 `as`，避免破坏 `cast(x as type)`；**HAVING** 参与 AND/OR 缩进；子查询后 **ON 与 JOIN 同列**（不再与 `)` 对齐）；**`align_cross_line_parens`** 接入流水线（闭行前全空白、`cc==0`、行尾 `--` 无换行等边界修复）。
+  - 📐 **AS**：选列闸门极差 ≤50 时整块单列 `as`；否则分档用 **`tier_len`**（与闸门同源），组内目标列用 **`gate_abs_end`**（`analyze_select_block` / `calculate_target_as_column`）；`skill.md` §2.2 与 README 本节已同步。
   - 📄 **文档**：`docs/KNOWN_ISSUES.md` 含 Issue #2、**#4**（多行 case + 独占 `)` 后行首逗号错位）；README **v3.1 摘要**与 **CJK / 多 IDE 列别名视觉差异**说明。
 
 - **v2.5** (2026-04-01) 🔧

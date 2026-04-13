@@ -57,7 +57,7 @@ SQL 代码对齐工具 v3.1
 * 子查询内容相对括号缩进 6 个空格
 * 所有规则递归生效
 
-**其他能力（不改变上述硬规范优先级）**：标准化运算符空格；修复 ``select as field``；缺失 ``AS`` 补全（跳过含 ``CASE``/``WHEN``/``THEN`` 行）；``WHERE``/``HAVING``/``AND``/``OR``/``ON`` 对齐；``split_inline_join_on_lines``；跨行圆括号 ``align_cross_line_parens``；``grouping sets`` / ``union`` 链布局；删除空行；SELECT 块 ``AS`` 分级对齐；``CREATE TABLE`` 列定义对齐。
+**其他能力（不改变上述硬规范优先级）**：标准化运算符空格；修复 ``select as field``；缺失 ``AS`` 补全（跳过含 ``CASE``/``WHEN``/``THEN`` 行）；``WHERE``/``HAVING``/``AND``/``OR``/``ON`` 对齐；``split_inline_join_on_lines``；跨行圆括号 ``align_cross_line_parens``；``grouping sets`` / ``union`` 链布局；删除空行；SELECT 块 ``AS`` 对齐：选列区（不含整行 ``--``）按**句首逗号列（1-based）垂直续行**逐行量字符长（有列别名 ``as`` 时右端为 ``as`` 前最后非空），极差 ≤ ``SELECT_AS_UNIFY_HEAD_CHAR_SPAN_MAX``（默认 50）时整块单列 ``as``，否则短/中/长分级（**分档长度 ``tier_len`` 与闸门同源 ref→``as`` 前显示宽**，避免跨行续行片段误归短档）；右端目标列用 ``gate_abs_end``；``CREATE TABLE`` 列定义对齐。
 
 使用方法：
   python sql_aligner.py <input_file> [选项]
@@ -83,6 +83,8 @@ CJK_WIDTH_RATIO = 2.0
 SHORT_FIELD_MAX = 50
 MEDIUM_FIELD_MAX = 100
 AS_SPACING = 1
+# 选列区（整行 ``--`` 除外）按句首逗号列 1-based 垂直续行逐行量字符长（含 ``as`` 行以列别名 ``as`` 前最后非空为右端）；极差 ≤ 此值时整块 ``as`` 单列对齐，否则仍走短/中/长分级。
+SELECT_AS_UNIFY_HEAD_CHAR_SPAN_MAX = 50
 SUBQUERY_INDENT = 6
 # ``with … as`` / ``, … as`` 独占行且下一行仅 ``(`` 并与定义行同列：第一层体锚定为**定义行首列 + SUBQUERY_INDENT**（与 ``from/join`` + 独占 ``(`` 一致）。
 _CTE_AS_OPEN_HEAD_RE = re.compile(
@@ -2617,8 +2619,8 @@ def align_union_branch_keyword_column(lines: List[str]) -> List[str]:
 def align_case_when_columns(lines: List[str]) -> List[str]:
     """按模块文档 **【CASE WHEN 排版规范】** 对多行 CASE 做列收敛（须已配合 ``merge_case_when`` 等前置步骤）。
 
-    落实：同层 ``case``/``end``；同层 ``when``/``else``（栈顶 ``when_col``）；``then``/``else`` 行尾后子 ``case`` 列
-    （``_col_child_case_after_parent_then`` / ``_col_child_case_after_parent_else``）；单行判定 ``_case_when_fully_closed_on_line``；
+    落实：同层 ``case``/``end``；同层 ``when``/``else``（栈顶 ``when_col``）；``then``/``else`` 独占行尾后换行且下一行直接 ``case when`` 时，子 ``case`` 与栈顶 ``when_col`` 同列（父级同层 ``when``/``else`` 起列）；其它 ``then``/``else`` 后子 ``case`` 仍可用
+    ``_col_child_case_after_parent_then`` / ``_col_child_case_after_parent_else``；单行判定 ``_case_when_fully_closed_on_line``；
     多行栈配对 ``end``；``case`` 后非 ``when`` 分支；CASE 内 ``and``/``or`` 续行。
     """
     new_lines: List[str] = []
@@ -2801,7 +2803,19 @@ def align_case_when_columns(lines: List[str]) -> List[str]:
             elif re.match(r"^case\b", s, re.I) and i > 0:
                 prev_ln = lines[i - 1].split("\n", 1)[0].rstrip()
                 pcol: Optional[int] = None
-                if re.search(r"(?i)\bthen\s*$", prev_ln):
+                # ``then``/``else`` 独占行尾后换行、下一行直接 ``case when``：子 ``case`` 与父级同层 ``when``/``else`` 起列（栈顶 ``when_col``），
+                # 不追逐物理行中 ``then`` 后首非空（避免被 AS/子查询缩进拉至极右）。
+                _sub_case_when = bool(re.search(r"(?i)^case\s+when\s+", s))
+                if (
+                    stack
+                    and _sub_case_when
+                    and (
+                        re.search(r"(?i)\bthen\s*$", prev_ln)
+                        or re.search(r"(?i)\belse\s*$", prev_ln)
+                    )
+                ):
+                    pcol = stack[-1][1]
+                elif re.search(r"(?i)\bthen\s*$", prev_ln):
                     pcol = _col_child_case_after_parent_then(lines[i - 1], raw)
                 elif re.search(r"(?i)\belse\s*$", prev_ln):
                     pcol = _col_child_case_after_parent_else(lines[i - 1], raw)
@@ -3714,6 +3728,35 @@ def _is_as_inside_unclosed_cast(line: str, as_match) -> bool:
     return False
 
 
+def _last_nonspace_idx_before_column_as(lb: str) -> Optional[int]:
+    """列别名 `` as word`` 之前最后一个非空字符的 0-based 下标；无合法列别名 ``as`` 则 ``None``。"""
+    for cand in reversed(list(re.finditer(r"\s+as\s+(\w+)", lb, re.I))):
+        if _is_as_inside_unclosed_cast(lb, cand):
+            continue
+        pre = lb[: cand.start()]
+        pre2 = pre.rstrip()
+        if not pre2:
+            return cand.start() - 1
+        return len(pre2) - 1
+    return None
+
+
+def _unify_gate_char_span_len_from_pos(lb: str, pos: int) -> int:
+    """闸门用：从 0-based ``pos`` 起，到该行「列别名 ``as`` 前最后非空」或（无 ``as`` 时）行末最后非空的字符个数。"""
+    end_as = _last_nonspace_idx_before_column_as(lb)
+    if end_as is None:
+        end0 = len(lb.rstrip()) - 1
+        while end0 >= pos and lb[end0] in " \t":
+            end0 -= 1
+    else:
+        end0 = end_as
+        while end0 >= pos and lb[end0] in " \t":
+            end0 -= 1
+    if end0 < pos:
+        return 0
+    return end0 - pos + 1
+
+
 def parse_select_field(line: str) -> Tuple[str, int, str, str, int]:
     """解析 SELECT 字段行，返回字段表达式、AS位置、别名、原始行、字段起始位置"""
     matches = list(re.finditer(r'\s+as\s+(\w+)', line, re.IGNORECASE))
@@ -3802,6 +3845,105 @@ def detect_select_blocks(lines: List[str]) -> List[Tuple[int, int, str]]:
     return blocks
 
 
+def _select_list_line_char_len_unify_gate(lb: str, ref_1based: Optional[int]) -> Tuple[int, Optional[int]]:
+    """单行字符长度（闸门用）及头行对 ``ref_1based`` 的更新。
+
+    头行：``select``/``group by`` 起首或 strip 以 ``,`` 起首——从句首逗号等价列（1-based 记为 ``ref``）起，至该行**列别名** ``as`` **之前**最后一个非空字符（无 ``as`` 则至行末最后非空）。
+
+    续行：从 ``ref_1based`` 在本行的垂直位置（下标 ``ref_1based - 1``）起，规则同上。
+
+    返回 ``(length, new_ref_1based_or_None)``；头行时第二元为新的 ``ref``；续行时第二元为 ``None``。
+    """
+    st = lb.strip()
+    if not st or st.startswith("--"):
+        return -1, None
+    if re.match(r"^\s*select\s+", lb, re.I):
+        m = re.search(r"\bselect\b", lb, re.I)
+        if not m:
+            return -1, None
+        pos = m.end()
+        while pos < len(lb) and lb[pos] in " \t":
+            pos += 1
+        new_ref = pos + 1
+        return _unify_gate_char_span_len_from_pos(lb, pos), new_ref
+    if re.match(r"^\s*group\s+by\s+", lb, re.I):
+        m = re.search(r"\bgroup\s+by\b", lb, re.I)
+        if not m:
+            return -1, None
+        pos = m.end()
+        while pos < len(lb) and lb[pos] in " \t":
+            pos += 1
+        new_ref = pos + 1
+        return _unify_gate_char_span_len_from_pos(lb, pos), new_ref
+    if st.startswith(","):
+        pos = len(lb) - len(lb.lstrip())
+        new_ref = pos + 1
+        return _unify_gate_char_span_len_from_pos(lb, pos), new_ref
+    # 续行
+    if ref_1based is None:
+        return -1, None
+    pos = ref_1based - 1
+    if pos >= len(lb):
+        return 0, None
+    return _unify_gate_char_span_len_from_pos(lb, pos), None
+
+
+def select_block_unify_as_by_head_char_span(lines: List[str], start: int, end: int) -> bool:
+    """同一 SELECT 块内：选列区每物理行（整行 ``--`` 除外）按句首逗号列 1-based 垂直续行量字符长（有列别名 ``as`` 时以 ``as`` 前最后非空为右端）；若 ``max-min`` ≤ ``SELECT_AS_UNIFY_HEAD_CHAR_SPAN_MAX`` 则整块 ``as`` 单列对齐。"""
+    lens: List[int] = []
+    ref_1based: Optional[int] = None
+    for i in range(start, min(end + 1, len(lines))):
+        raw = lines[i]
+        lb = raw.split("\n", 1)[0]
+        L, new_ref = _select_list_line_char_len_unify_gate(lb, ref_1based)
+        if L < 0:
+            continue
+        if new_ref is not None:
+            ref_1based = new_ref
+        lens.append(L)
+    if not lens:
+        return False
+    return (max(lens) - min(lens)) <= SELECT_AS_UNIFY_HEAD_CHAR_SPAN_MAX
+
+
+def _gate_ref_before_line(lines: List[str], select_start: int, line_idx: int) -> Optional[int]:
+    """模拟闸门逐行扫描，返回处理 ``line_idx`` 行时沿用的句首 ref（1-based）；与 ``_select_list_line_char_len_unify_gate`` 一致。"""
+    ref_1based: Optional[int] = None
+    for i in range(select_start, min(line_idx, len(lines))):
+        lb = lines[i].split("\n", 1)[0]
+        st = lb.strip()
+        if not st or st.startswith("--"):
+            continue
+        _, new_ref = _select_list_line_char_len_unify_gate(lb, ref_1based)
+        if new_ref is not None:
+            ref_1based = new_ref
+    return ref_1based
+
+
+def _field_gate_rel_display_width(
+    lines: List[str], select_start: int, line_num: int, lb: str
+) -> Optional[float]:
+    """与闸门一致：从句首 ref（垂直对齐列）到列别名 ``as`` 前最后非空的显示宽度（续行同 ref）。"""
+    ref_1based = _gate_ref_before_line(lines, select_start, line_num)
+    if ref_1based is None:
+        return None
+    pos = ref_1based - 1
+    if pos < 0 or pos >= len(lb):
+        return None
+    end_as = _last_nonspace_idx_before_column_as(lb)
+    if end_as is None or end_as < pos:
+        return None
+    return get_width(lb[pos : end_as + 1])
+
+
+def _field_gate_abs_end_display(lb: str) -> Optional[float]:
+    """行首至列别名 ``as`` 前最后非空字符的显示宽度（与 ref + rel 之和一致）。"""
+    end_as = _last_nonspace_idx_before_column_as(lb)
+    if end_as is None:
+        return None
+    return get_width(lb[: end_as + 1])
+
+
 def analyze_select_block(lines: List[str], start: int, end: int) -> Dict:
     """分析 SELECT 块中的字段并按长度分组"""
     fields = []
@@ -3812,20 +3954,26 @@ def analyze_select_block(lines: List[str], start: int, end: int) -> Dict:
 
         if field_expr and alias:
             field_len = get_width(field_expr)
+            lb = line.split("\n", 1)[0]
+            gate_rel = _field_gate_rel_display_width(lines, start, i, lb)
+            gate_abs_end = _field_gate_abs_end_display(lb)
+            tier_len = float(gate_rel) if gate_rel is not None else float(field_len)
 
             fields.append({
                 'line_num': i,
                 'field_expr': field_expr,
                 'field_len': field_len,
+                'tier_len': tier_len,
+                'gate_abs_end': gate_abs_end,
                 'as_pos': as_pos,
                 'alias': alias,
                 'original': original,
                 'field_start_pos': field_start_pos
             })
 
-    short = [f for f in fields if f['field_len'] <= SHORT_FIELD_MAX]
-    medium = [f for f in fields if SHORT_FIELD_MAX < f['field_len'] <= MEDIUM_FIELD_MAX]
-    long = [f for f in fields if f['field_len'] > MEDIUM_FIELD_MAX]
+    short = [f for f in fields if f['tier_len'] <= SHORT_FIELD_MAX]
+    medium = [f for f in fields if SHORT_FIELD_MAX < f['tier_len'] <= MEDIUM_FIELD_MAX]
+    long = [f for f in fields if f['tier_len'] > MEDIUM_FIELD_MAX]
 
     return {
         'short': short,
@@ -3836,16 +3984,17 @@ def analyze_select_block(lines: List[str], start: int, end: int) -> Dict:
 
 
 def calculate_target_as_column(fields: List[Dict]) -> int:
-    """计算目标 AS 对齐列位置"""
+    """计算目标 AS 对齐列位置（右端优先用闸门同源的 ``gate_abs_end``，避免跨行续行片段误算）。"""
     if not fields:
         return 0
 
     max_field_end_pos = 0
     for field in fields:
+        end_w = field.get("gate_abs_end")
+        if end_w is None:
+            end_w = float(field["field_start_pos"]) + float(field["field_len"])
         # 用 floor 取「表达式尾后第一列」，避免浮点宽度使 max 比 ideal 大 1
-        end_i = int(
-            math.floor(float(field["field_start_pos"]) + float(field["field_len"]) + 1e-9)
-        )
+        end_i = int(math.floor(float(end_w) + 1e-9))
         max_field_end_pos = max(max_field_end_pos, end_i)
     return max_field_end_pos + AS_SPACING
 
@@ -3915,6 +4064,13 @@ def align_fields_in_place(lines: List[str], fields: List[Dict], target_col: int,
 def verify_select_alignment(lines: List[str], start: int, end: int) -> bool:
     """验证 SELECT 块的 AS 对齐情况"""
     result = analyze_select_block(lines, start, end)
+
+    if not result["all"]:
+        return True
+
+    if select_block_unify_as_by_head_char_span(lines, start, end):
+        as_positions = set(f["as_pos"] for f in result["all"])
+        return len(as_positions) <= 1
 
     is_aligned = True
     group_as_positions = {}
@@ -4377,39 +4533,75 @@ def format_sql_file(input_file: str, verify_only: bool = False,
                 print("  (无 AS 别名)")
                 continue
 
-            for group_name, group_label in [('short', '短字段'), ('medium', '中字段'), ('long', '长字段')]:
-                group = result[group_name]
-
-                if not group:
-                    continue
-
-                print(f"\n  {group_label}组: {len(group)} 个字段")
-
-                current_positions = set(f['as_pos'] for f in group)
-                target_col = calculate_target_as_column(group)
-
+            if select_block_unify_as_by_head_char_span(modified_lines, start, end):
+                all_fields = result["all"]
+                print(
+                    f"\n  选列头行字符极差 ≤ {SELECT_AS_UNIFY_HEAD_CHAR_SPAN_MAX}：整块 AS 统一对齐（{len(all_fields)} 个字段）"
+                )
+                current_positions = set(f["as_pos"] for f in all_fields)
+                target_col = calculate_target_as_column(all_fields)
                 if len(current_positions) == 1:
                     current_col = list(current_positions)[0]
                     if current_col == target_col:
-                        print(f"    ✅ 已对齐在第 {current_col} 列")
-                        # 即使AS已对齐，也需要统一逗号缩进
+                        print(f"    ✅ 已统一对齐在第 {current_col} 列")
                         if not verify_only:
-                            modified_lines = align_fields_in_place(modified_lines, group, target_col, start)
+                            modified_lines = align_fields_in_place(
+                                modified_lines, all_fields, target_col, start
+                            )
                     else:
-                        print(f"    ⚠️  已对齐但位置不对: 当前第 {current_col} 列，应为第 {target_col} 列")
+                        print(
+                            f"    ⚠️  已对齐但位置不对: 当前第 {current_col} 列，应为第 {target_col} 列"
+                        )
                         all_aligned = False
                         if not verify_only:
                             print(f"    🔧 重新对齐到第 {target_col} 列...")
-                            modified_lines = align_fields_in_place(modified_lines, group, target_col, start)
+                            modified_lines = align_fields_in_place(
+                                modified_lines, all_fields, target_col, start
+                            )
                             print(f"    ✅ 已完成对齐")
                 else:
                     print(f"    ⚠️  未对齐: AS位置 = {sorted(current_positions)}")
                     all_aligned = False
-
                     if not verify_only:
                         print(f"    🔧 对齐到第 {target_col} 列...")
-                        modified_lines = align_fields_in_place(modified_lines, group, target_col, start)
+                        modified_lines = align_fields_in_place(
+                            modified_lines, all_fields, target_col, start
+                        )
                         print(f"    ✅ 已完成对齐")
+            else:
+                for group_name, group_label in [('short', '短字段'), ('medium', '中字段'), ('long', '长字段')]:
+                    group = result[group_name]
+
+                    if not group:
+                        continue
+
+                    print(f"\n  {group_label}组: {len(group)} 个字段")
+
+                    current_positions = set(f['as_pos'] for f in group)
+                    target_col = calculate_target_as_column(group)
+
+                    if len(current_positions) == 1:
+                        current_col = list(current_positions)[0]
+                        if current_col == target_col:
+                            print(f"    ✅ 已对齐在第 {current_col} 列")
+                            # 即使AS已对齐，也需要统一逗号缩进
+                            if not verify_only:
+                                modified_lines = align_fields_in_place(modified_lines, group, target_col, start)
+                        else:
+                            print(f"    ⚠️  已对齐但位置不对: 当前第 {current_col} 列，应为第 {target_col} 列")
+                            all_aligned = False
+                            if not verify_only:
+                                print(f"    🔧 重新对齐到第 {target_col} 列...")
+                                modified_lines = align_fields_in_place(modified_lines, group, target_col, start)
+                                print(f"    ✅ 已完成对齐")
+                    else:
+                        print(f"    ⚠️  未对齐: AS位置 = {sorted(current_positions)}")
+                        all_aligned = False
+
+                        if not verify_only:
+                            print(f"    🔧 对齐到第 {target_col} 列...")
+                            modified_lines = align_fields_in_place(modified_lines, group, target_col, start)
+                            print(f"    ✅ 已完成对齐")
 
         print(f"\n{'='*70}\n")
 

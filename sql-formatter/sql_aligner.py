@@ -35,7 +35,7 @@ SQL 代码对齐工具 v3.1
 
 9. 对于子查询，包裹子查询的左括号 ``(`` 和右括号 ``)`` 必须各自单独占一行。
 10. 包裹子查询的括号所在列，必须与其对应的 ``from``、``join``、``left join``、``right join``、``inner join``、``cross join`` 等关键字垂直对齐（``align_subquery_brackets``、``align_join_after_subquery_close`` 等）。
-11. 子查询内部的所有 SQL 语句，必须相对包裹它的左括号 ``(`` 额外缩进 **6** 个空格（常量 ``SUBQUERY_INDENT = 6``）。
+11. 子查询内部的第一层查询体：当 **独占一行的** ``from`` / ``join`` / … **或** ``with … as`` / ``, … as`` **且** 下一行仅为 ``(`` 并与该关键字/定义行起始列相同时，行首基准列**唯一**为「该关键字或 CTE 定义行起始列 + ``SUBQUERY_INDENT``（6）」；第一层内保留**相对**缩进时以**首条** ``select``/``group by`` 行行首为参照，**不得**因 CASE 的 ``when``/``else``/``end`` 等拉低 ``min`` 而导致整块相对「+6」再整体偏移（``align_subquery_brackets``）。
 12. 若子查询中继续嵌套子查询，则相同规则递归生效，即新一层子查询内部继续相对其外层括号缩进 6 个空格。
 
 **四、通用要求**
@@ -84,6 +84,11 @@ SHORT_FIELD_MAX = 50
 MEDIUM_FIELD_MAX = 100
 AS_SPACING = 1
 SUBQUERY_INDENT = 6
+# ``with … as`` / ``, … as`` 独占行且下一行仅 ``(`` 并与定义行同列：第一层体锚定为**定义行首列 + SUBQUERY_INDENT**（与 ``from/join`` + 独占 ``(`` 一致）。
+_CTE_AS_OPEN_HEAD_RE = re.compile(
+    r"^(\s*)(?:(?:,\s*.+)|(?:\bwith\s+.+))\s+as\s*$",
+    re.IGNORECASE,
+)
 # 独立 ``on`` 行条件体至少多长才按顶层 `` and `` 折行（避免短句误拆）
 LONG_ON_PREDICATE_MIN_LEN = 48
 
@@ -1093,7 +1098,9 @@ def fix_open_paren_indent_after_lone_from(lines: List[str]) -> List[str]:
 
 
 def align_subquery_brackets(lines: List[str]) -> List[str]:
-    """对齐子查询括号：括号与FROM/JOIN关键字对齐，内部SQL缩进=括号缩进+6
+    """对齐子查询括号：括号与 FROM/JOIN 或 CTE（``with … as`` / ``, … as``）对齐，第一层体行首=定义行首列+6。
+
+    第一层内相对缩进以首条 ``select``/``group by`` 行行首为参照，避免 ``when``/``else``/``end`` 参与 min 拉低整块。
 
     递归处理嵌套的子查询
 
@@ -1111,7 +1118,11 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
     for line in lines:
         stripped = line.strip()
         # 检测 FROM/JOIN 后直接跟括号的情况 (如 "from (" 或 "left join (")
-        match = re.match(r'^(\s*)(from|left\s+join|right\s+join|inner\s+join|join)\s+\(\s*$', line, re.IGNORECASE)
+        match = re.match(
+            r"^(\s*)(from|left\s+join|right\s+join|inner\s+join|cross\s+join|join)\s+\(\s*$",
+            line,
+            re.IGNORECASE,
+        )
         if match:
             indent = match.group(1)
             keyword = match.group(2)
@@ -1135,8 +1146,13 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
         line = preprocessed_lines[i]
         stripped = line.strip().lower()
 
-        # 检测FROM或JOIN关键字
-        if re.match(r'^\s*(from|left\s+join|right\s+join|inner\s+join|join)\s*$', line, re.IGNORECASE):
+        # 检测 FROM/JOIN 独占行，或 ``with … as`` / ``, … as`` 独占行（CTE 与括号对齐规则同 from/join）
+        _from_join_only = re.match(
+            r"^\s*(from|left\s+join|right\s+join|inner\s+join|cross\s+join|join)\s*$",
+            line,
+            re.IGNORECASE,
+        )
+        if _from_join_only or _CTE_AS_OPEN_HEAD_RE.match(line):
             base_indent = len(line) - len(line.lstrip())
             new_lines.append(line)
             i += 1
@@ -1257,7 +1273,7 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
                                     current_indent = len(subline) - len(subline.lstrip())
                                     min_indent = min(min_indent, current_indent)
                                 elif not re.match(
-                                    r'^(from|where|group\s+by|having|order\s+by|limit|union|left\s+join|right\s+join|inner\s+join|join|on|and|or)\b',
+                                    r'^(from|where|group\s+by|having|order\s+by|limit|union|left\s+join|right\s+join|inner\s+join|cross\s+join|join|on|and|or|when|else|end)\b',
                                     stripped,
                                     re.IGNORECASE,
                                 ):
@@ -1266,6 +1282,29 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
 
                         if min_indent == float('inf'):
                             min_indent = 0
+
+                        # 第一层相对缩进：以首条 ``select``/``group by`` 行行首为参照（fallback 为 min_indent），
+                        # 避免 ``when``/``else``/``end`` 等参与 min 拉低导致整块偏离「关键字列 + 6」。
+                        _ref_sel_lead: Optional[int] = None
+                        _bd_rf = 0
+                        for _sl in processed_subquery:
+                            if re.match(r"^\s*\(", _sl):
+                                _bd_rf += 1
+                                continue
+                            if re.match(r"^\s*\)", _sl):
+                                _bd_rf -= 1
+                                continue
+                            if _bd_rf != 0:
+                                continue
+                            _st = _sl.strip()
+                            if not _st or _st.startswith("--"):
+                                continue
+                            if re.match(r"^(select|group\s+by)\b", _st, re.IGNORECASE):
+                                _ref_sel_lead = len(_sl) - len(_sl.lstrip(" \t"))
+                                break
+                        _rel_base = (
+                            _ref_sel_lead if _ref_sel_lead is not None else min_indent
+                        )
 
                         # 【2026-04-11 修复】调整缩进时也要跟踪括号深度
                         # 只调整第一层的行，嵌套子查询的行保持不变（已被递归处理）
@@ -1416,7 +1455,7 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
                                             )
                                         else:
                                             _cur_id = len(subline) - len(subline.lstrip())
-                                            _rel_id = _cur_id - min_indent
+                                            _rel_id = _cur_id - _rel_base
                                             new_inner_line = (
                                                 " "
                                                 * (target_indent + _rel_id)
@@ -1539,7 +1578,7 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
                                                     subline.lstrip()
                                                 )
                                                 relative_indent = (
-                                                    current_indent - min_indent
+                                                    current_indent - _rel_base
                                                 )
                                                 new_inner_line = (
                                                     " "
@@ -1566,7 +1605,7 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
                                                     subline.lstrip()
                                                 )
                                                 relative_indent = (
-                                                    current_indent - min_indent
+                                                    current_indent - _rel_base
                                                 )
                                                 new_inner_line = (
                                                     " "
@@ -1623,7 +1662,7 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
                                                     subline.lstrip()
                                                 )
                                                 relative_indent = (
-                                                    current_indent - min_indent
+                                                    current_indent - _rel_base
                                                 )
                                                 new_inner_line = (
                                                     " "
@@ -1635,7 +1674,7 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
                                             current_indent = len(subline) - len(
                                                 subline.lstrip()
                                             )
-                                            relative_indent = current_indent - min_indent
+                                            relative_indent = current_indent - _rel_base
                                             new_inner_line = (
                                                 " "
                                                 * (target_indent + relative_indent)
@@ -4223,6 +4262,16 @@ def format_sql_file(input_file: str, verify_only: bool = False,
         )
         if cte_comma_count > 0:
             print(f"✅ 校正 {cte_comma_count} 行 WITH 链逗号缩进")
+
+        # 4.015 ``fix_with_cte_comma_indent`` 会将 ``name as (`` 拆成 ``, name as`` 与独占 ``(``，
+        # 须在拆分后再次对齐子查询，方能使 CTE 第一层体套用与 ``from/join`` 相同的「定义行首列 + 6」锚定。
+        original_lines = lines.copy()
+        lines = align_subquery_brackets(lines)
+        bracket_count_cte = sum(
+            1 for i in range(len(lines)) if i < len(original_lines) and lines[i] != original_lines[i]
+        )
+        if bracket_count_cte > 0:
+            print(f"✅ CTE 拆行后第三次对齐子查询括号，调整 {bracket_count_cte} 行")
 
         # 4.5 CASE：case/end 同列，when/else 同列（在子查询与字段对齐之后再收敛一次）
         original_lines = lines.copy()

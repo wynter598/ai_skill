@@ -212,6 +212,7 @@ python3 sql_aligner.py file.sql
   - 📌 与 `skill.md` 定稿对齐：**ON 一律换行**；**WHERE / HAVING** 与 **AND/OR** 列规则；**全局行首逗号**；注释 **`--` 与正文整体**等（见上文「v3.1 规范摘要」）。
   - 🐛 **工具**：`add_missing_as_keywords` 跳过含 `CASE` / `WHEN…THEN` 的行，避免误插 `then as col`；`parse_select_field` 跳过 `cast(` 未闭合内的 `as`，避免破坏 `cast(x as type)`；**HAVING** 参与 AND/OR 缩进；子查询后 **ON 与 JOIN 同列**（不再与 `)` 对齐）；**`align_cross_line_parens`** 接入流水线（闭行前全空白、`cc==0`、行尾 `--` 无换行等边界修复）。
   - 📐 **AS**：选列闸门极差 ≤50 时整块单列 `as`；否则分档用 **`tier_len`**（与闸门同源），组内目标列用 **`gate_abs_end`**（`analyze_select_block` / `calculate_target_as_column`）；`skill.md` §2.2 与 README 本节已同步。
+  - 📐 **CASE**：子 `case` 列锚优先 **首行首 `when`（`when_col`）**；`then`/`else` 独占行尾 + 下行 `case when` 走栈顶 `when_col`；**允许** `then case when` 同行紧凑；详见 `skill.md` §2.3 与 `sql_aligner.py` 文件头 CASE 第 3 条。
   - 📄 **文档**：`docs/KNOWN_ISSUES.md` 含 Issue #2、**#4**（多行 case + 独占 `)` 后行首逗号错位）；README **v3.1 摘要**与 **CJK / 多 IDE 列别名视觉差异**说明。
 
 - **v2.5** (2026-04-01) 🔧

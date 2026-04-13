@@ -320,13 +320,15 @@ left join
 3. **`else` 与 `when` 首字母同一列**：`else` 单独成行时，其首字母与上述 **WHEN** 列对齐（`when` 与 `else` 同列）。
 4. **`end` 与 `case` 首字母同一列**：`end`（及之后的 `as` 别名等）所在行，`end` 首字母与**本块**起始 **`case`** 首字母垂直对齐。
 5. 若 WHEN 条件字符数 > 100，则将 THEN 换行，且 THEN 与此条件中 WHEN 后的第一个字母垂直对齐
-6. **嵌套CASE WHEN规则**：若THEN后紧跟子CASE WHEN
-   - **THEN关键字保持在WHEN同一行**（不换行）
-   - **子CASE关键字换行**，新起一行
-   - **子CASE首字母与父级WHEN首字母垂直对齐**
-   - 递归应用：多层嵌套继续遵循此规则
+6. **嵌套 CASE / 函数首参 CASE（与 `sql_aligner.py` 一致）**
+   - **列锚（优先）**：子级 **`case` 的 `C`** 与父块**物理首行**中与 `case` 同行的**第一个 `when` 的 `W`** 同列（即工具栈顶 **`when_col`**）。与「`THEN` 后首非空」「`AS` 竖线」「子查询体 +6」等冲突时，**不得**为迁就其它规则而平移该子 `case` 起始列。
+   - **`THEN` 独占行尾 + 下一行直接 `case when`**：必须满足上条列锚（子 `case` 新起一行时与首行首 `when` 的 `W` 对齐）。
+   - **`then case when` 同行（紧凑）**：**允许**不拆行；**禁止**仅为套用列锚而强行把 `then` 改成独占行尾（避免无谓增行）。若已紧凑同行，后续若再换行起子 `case`，仍优先 **`when_col`**。
+   - **函数首参为 CASE**：允许 **`函数名(` 与 `case` 同行**（如 `coalesce(case when …`），不必为 `case` 单独起行。
+   - **二元运算符**：`/ * < =` 等两侧各 **1** 个空格（与工具运算符空格步骤一致）。
+   - **递归**：多层嵌套每层各自有首行首 `when` 列锚。
 
-**工具**：`sql_aligner.py` 在 `merge_case_when` 之后由 **`align_case_when_columns`** 再次收敛上述列位置（避免后续子查询/字段对齐改写导致 `else` 比 `when` 偏 1 格）。
+**工具**：`sql_aligner.py` 在 `merge_case_when` 之后由 **`align_case_when_columns`** 收敛列位置；`THEN` 行尾 + 下行 `case when` 时用 **`when_col`**，否则回退 **`_col_child_case_after_parent_then` / `_col_child_case_after_parent_else`**（见工具文件头 CASE 第 3 条）。
 
 ```sql
 -- ✅ 正确示例：简单CASE WHEN

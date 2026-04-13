@@ -14,15 +14,19 @@ SQL 代码对齐工具 v3.1
 
 1. 同一层级内，``CASE`` 与其对应的 ``END`` 必须左对齐，即起始列相同。
 2. 同一层级内，所有 ``WHEN`` 与 ``ELSE`` 必须垂直对齐，即起始列相同。
-3. 若 ``THEN`` 后存在嵌套 ``CASE WHEN``，则子级 ``CASE`` 的首字母 ``C``，必须与父级 ``THEN`` 后第一个非空字符对齐（``THEN`` 独占行尾时，以子块续行首非空列等价处理，见 ``_col_child_case_after_parent_then``）。
+3. **嵌套 ``CASE`` 列锚（优先级高于 ``THEN`` 后首非空、AS 对齐、子查询体缩进）**：
+   * **首行锚**：父块**物理首行**中与 ``case`` 同行的**第一个 ``when``** 关键字首字母 ``W`` 所在列（``when_col``，与 ``merge_case_when`` 中 ``case `` 后接 ``when`` 的列一致）。
+   * **``THEN`` 独占行尾且下一行以 ``case when`` 起首**：子 ``case`` 的 ``C`` 与上述 **``when_col``** 同列（``align_case_when_columns`` 用栈顶 ``when_col``，**不**再追逐 ``THEN`` 后首非空）。
+   * **``then case when`` 同行（紧凑写法）**：允许不拆行；**不要求**为对齐强行把 ``then`` 改成独占行尾。若已同行，子 ``case`` 列由该行内结构决定，后续换行子 ``case`` 仍优先 **``when_col``**（若栈已入）。
+   * **其它** ``then``/``else`` 行尾形态：仍可用 ``_col_child_case_after_parent_then`` / ``_col_child_case_after_parent_else`` 作回退。
 4. 所有嵌套 ``CASE`` 块都必须递归遵守以上规则（实现：``merge_case_when`` / ``align_case_when_columns`` 等）。
 
    **补充（实现要点）**
 
    * ``case`` 后非 ``when``：换行 ``when``/``else`` 与 ``case`` 后首非空同列；``end`` 与 ``case`` 同列（``align_case_when_columns`` 分支）。
    * 单行/多行判定：``_case_when_fully_closed_on_line``；多行块用 ``(case_col, when_col)`` 栈配对 ``end``，``else case when`` 未闭 ``end`` 时压栈。
-   * ``THEN``/``ELSE`` 后子 ``CASE``：``_col_child_case_after_parent_then`` / ``_col_child_case_after_parent_else``。
-   * ``WHEN``/``ELSE`` 列仅由栈顶同层 ``when`` 列决定，不依赖 ``THEN`` 行形态；首行幂等：``_replace_leading_indent_first_line``。
+   * ``THEN``/``ELSE`` 后子 ``CASE``：见上条 **3.**；``_col_child_case_after_parent_then`` / ``_col_child_case_after_parent_else`` 仅作**未命中** ``when_col`` 分支时的回退。
+   * ``WHEN``/``ELSE`` 列由栈顶同层 ``when_col`` 决定；首行幂等：``_replace_leading_indent_first_line``。
    * ``group by grouping sets``：``align_grouping_sets_layout``。
 
 **二、SELECT 字段列表规则**
@@ -49,7 +53,7 @@ SQL 代码对齐工具 v3.1
 
 * 同层级 ``CASE`` 与 ``END`` 左对齐
 * 同层级 ``WHEN`` 与 ``ELSE`` 垂直对齐
-* 子级 ``CASE`` 对齐父级 ``THEN`` 后第一个非空字符
+* 子级 ``CASE`` 列锚：优先与父块首行第一个 ``when``（``when_col``）同列；``THEN`` 独占行尾 + 下行 ``case when`` 时必用 ``when_col``；否则回退 ``THEN``/``ELSE`` 后首非空
 * ``SELECT`` 后第一个字段与 ``SELECT`` 同行
 * 后续字段采用句首逗号，逗号后空 1 格
 * 后续字段逗号后的首字符与第一个字段首字母对齐
@@ -2265,7 +2269,7 @@ def _continuation_col_after_when_above(lines: List[str], idx: int) -> Optional[i
 
 
 def _col_child_case_after_parent_then(prev_line: str, cur_line: str) -> Optional[int]:
-    """规范第3条：父行以 ``then`` 结尾时，子 ``case`` 换行后与父行首个 ``then`` 后首非空同列；``then`` 后无同行内容则与子行 ``case`` 关键字列一致。"""
+    """回退列：父行以 ``then`` 结尾且未走 ``when_col`` 分支时，子 ``case`` 与父行 ``then`` 后首非空同列；无同行内容则与子行 ``case`` 列一致。优先规则见文件头 CASE 第 3 条（``when_col``）。"""
     pre = prev_line.split("\n", 1)[0].rstrip("\n")
     cur0 = cur_line.split("\n", 1)[0]
     m_case = re.search(r"(?i)\bcase\b", cur0)
@@ -2619,8 +2623,8 @@ def align_union_branch_keyword_column(lines: List[str]) -> List[str]:
 def align_case_when_columns(lines: List[str]) -> List[str]:
     """按模块文档 **【CASE WHEN 排版规范】** 对多行 CASE 做列收敛（须已配合 ``merge_case_when`` 等前置步骤）。
 
-    落实：同层 ``case``/``end``；同层 ``when``/``else``（栈顶 ``when_col``）；``then``/``else`` 独占行尾后换行且下一行直接 ``case when`` 时，子 ``case`` 与栈顶 ``when_col`` 同列（父级同层 ``when``/``else`` 起列）；其它 ``then``/``else`` 后子 ``case`` 仍可用
-    ``_col_child_case_after_parent_then`` / ``_col_child_case_after_parent_else``；单行判定 ``_case_when_fully_closed_on_line``；
+    落实：同层 ``case``/``end``；同层 ``when``/``else``（栈顶 ``when_col``）；``then``/``else`` 独占行尾后换行且下一行直接 ``case when`` 时，子 ``case`` 与栈顶 ``when_col`` 同列（与父块首行第一个 ``when`` 的 ``W`` 一致）；**不要求**为对齐强行把同行的 ``then case when`` 拆开；其它形态仍可用
+    ``_col_child_case_after_parent_then`` / ``_col_child_case_after_parent_else`` 作回退；单行判定 ``_case_when_fully_closed_on_line``；
     多行栈配对 ``end``；``case`` 后非 ``when`` 分支；CASE 内 ``and``/``or`` 续行。
     """
     new_lines: List[str] = []

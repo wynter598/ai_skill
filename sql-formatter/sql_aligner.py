@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SQL 代码对齐工具 v3.1
+SQL 代码对齐工具 v3.1.1
 统一处理 SQL 代码中的各类对齐问题（含跨行圆括号 ``align_cross_line_parens``）：
 
 【安全约束】除显式规则（如缺失 ``as`` 补全）外，**不得删除或改写 SQL 语义字符**（标识符、字面量、运算符、括号、逗号等）；
@@ -35,12 +35,20 @@ SQL 代码对齐工具 v3.1
 7. 从第二个字段开始，使用「句首逗号」风格，即每行以逗号开头，逗号后必须保留 1 个空格（``convert_to_leading_comma``、``add_space_after_commas``）。
 8. 所有后续字段行中，逗号后的第一个非空字符，必须与 ``SELECT`` 后第一个字段的非空格首字符垂直对齐（``align_field_names``）。
 
-**三、子查询缩进规则**
+**三、子查询与查询块缩进规则**
 
 9. 对于子查询，包裹子查询的左括号 ``(`` 和右括号 ``)`` 必须各自单独占一行。
 10. 包裹子查询的括号所在列，必须与其对应的 ``from``、``join``、``left join``、``right join``、``inner join``、``cross join`` 等关键字垂直对齐（``align_subquery_brackets``、``align_join_after_subquery_close`` 等）。
 11. 子查询内部的第一层查询体：当 **独占一行的** ``from`` / ``join`` / … **或** ``with … as`` / ``, … as`` **且** 下一行仅为 ``(`` 并与该关键字/定义行起始列相同时，行首基准列**唯一**为「该关键字或 CTE 定义行起始列 + ``SUBQUERY_INDENT``（6）」；第一层内保留**相对**缩进时以**首条** ``select``/``group by`` 行行首为参照，**不得**因 CASE 的 ``when``/``else``/``end`` 等拉低 ``min`` 而导致整块相对「+6」再整体偏移（``align_subquery_brackets``）。
 12. 若子查询中继续嵌套子查询，则相同规则递归生效，即新一层子查询内部继续相对其外层括号缩进 6 个空格。
+
+**三（续）、同一查询块内主子句关键字列（目标规范；与 §2.4 / CASE 协同）**
+
+* **查询块**：同一嵌套层级、由同一套 ``select … from …``（及 ``where``/``group by``/``having``/``order by``/``limit``/``lateral view``/各类 ``join``/``union`` 等延续子句）构成的连续结构；外层与内层（子查询括号内）**各自**一套列锚。
+* **主子句竖线**：同一块内 ``select``、``from``、``where``、``group by``、``having``、``order by``、``lateral view``、``join``/``left join``/…、``union``/``union all``、``limit`` 等**行首关键字**宜与同块 ``from``/``join`` 所在**主句列**一致（与 skill §2.4 一致；嵌套块内单独一套）。
+* **括号块**：从左 ``(`` 的下一行到匹配 ``)`` 之前，相对该 ``(`` 所在列整体右移 ``SUBQUERY_INDENT``（6）；再嵌套则相对内层开括号再 +6；闭括号 ``)`` 与开括号 ``(`` 同列。
+* **优先级**：与本文件 **一、CASE WHEN** 列锚冲突时，**CASE 列锚优先**，不得为迁就主子句列而平移子 ``case``/``when`` 锚点。
+* **实现注**：原预处理中连续多次 ``align_subquery_brackets`` / ``UNION`` 后 ``align_field_names`` / ``align_where`` 后 ``align_case_when_columns`` 的因果，已分别收进 ``align_subquery_brackets``、``align_union_branch_keyword_column``、``align_where_and_clauses`` 的**单次对外调用**内部迭代至稳定（递归子块仍用单遍 ``_align_subquery_brackets_pass``，避免重复套叠）。
 
 **四、通用要求**
 
@@ -59,6 +67,8 @@ SQL 代码对齐工具 v3.1
 * 后续字段逗号后的首字符与第一个字段首字母对齐
 * 子查询括号单独占行
 * 子查询内容相对括号缩进 6 个空格
+* 同一查询块内主子句关键字列、括号层级 +6 与 **三（续）** 一致；与 CASE 列锚冲突时 CASE 优先
+* ``align_subquery_brackets`` / ``align_field_names`` / ``align_union_branch_keyword_column`` / ``align_where_and_clauses`` 对外单次调用内部迭代至稳定，替代原预处理中连续多轮同名调用
 * 所有规则递归生效
 
 **其他能力（不改变上述硬规范优先级）**：标准化运算符空格；修复 ``select as field``；缺失 ``AS`` 补全（跳过含 ``CASE``/``WHEN``/``THEN`` 行）；``WHERE``/``HAVING``/``AND``/``OR``/``ON`` 对齐；``split_inline_join_on_lines``；跨行圆括号 ``align_cross_line_parens``；``grouping sets`` / ``union`` 链布局；删除空行；SELECT 块 ``AS`` 对齐：选列区（不含整行 ``--``）按**句首逗号列（1-based）垂直续行**逐行量字符长（有列别名 ``as`` 时右端为 ``as`` 前最后非空），极差 ≤ ``SELECT_AS_UNIFY_HEAD_CHAR_SPAN_MAX``（默认 50）时整块单列 ``as``，否则短/中/长分级（**分档长度 ``tier_len`` 与闸门同源 ref→``as`` 前显示宽**，避免跨行续行片段误归短档）；右端目标列用 ``gate_abs_end``；``CREATE TABLE`` 列定义对齐。
@@ -90,6 +100,10 @@ AS_SPACING = 1
 # 选列区（整行 ``--`` 除外）按句首逗号列 1-based 垂直续行逐行量字符长（含 ``as`` 行以列别名 ``as`` 前最后非空为右端）；极差 ≤ 此值时整块 ``as`` 单列对齐，否则仍走短/中/长分级。
 SELECT_AS_UNIFY_HEAD_CHAR_SPAN_MAX = 50
 SUBQUERY_INDENT = 6
+# 对外 ``align_subquery_brackets`` 内部迭代至稳定之上限（合并原流水线中连续多轮同类调用）。
+_ALIGN_SUBQUERY_BRACKETS_MAX_STABLE = 10
+# ``align_field_names`` 内部迭代至稳定之上限（含 UNION 链后逗号列重算等）。
+_ALIGN_FIELD_NAMES_MAX_STABLE = 10
 # ``with … as`` / ``, … as`` 独占行且下一行仅 ``(`` 并与定义行同列：第一层体锚定为**定义行首列 + SUBQUERY_INDENT**（与 ``from/join`` + 独占 ``(`` 一致）。
 _CTE_AS_OPEN_HEAD_RE = re.compile(
     r"^(\s*)(?:(?:,\s*.+)|(?:\bwith\s+.+))\s+as\s*$",
@@ -222,7 +236,7 @@ def _nearest_select_indent_before(lines: List[str], idx: int) -> Optional[int]:
 
 
 def align_where_and_clauses(lines: List[str]) -> List[str]:
-    """对齐 WHERE/HAVING/JOIN 及其 ON/AND/OR 子句
+    """对齐 WHERE/HAVING/JOIN 及其 ON/AND/OR 子句；返回前对全文再跑一次 ``align_case_when_columns`` 以修复本步对 CASE 内续行的影响。
 
     规则：
     1. ON 与同层 from / left join 等首列对齐（由 JOIN 行缩进代表）
@@ -330,7 +344,9 @@ def align_where_and_clauses(lines: List[str]) -> List[str]:
 
         new_lines.append(line)
 
-    return new_lines
+    # ``align_where_and_clauses`` 可能把 SELECT 内多行 ``when`` 续行的 ``and``/``or`` 误按 WHERE 缩进；
+    # 因果收进本函数末尾一次 ``align_case_when_columns``（替代预处理中紧随其后的第二轮 CASE 对齐）。
+    return align_case_when_columns(new_lines)
 
 
 def remove_empty_lines(lines: List[str]) -> List[str]:
@@ -1082,24 +1098,53 @@ def _leading_indent_nearest_preceding_from_for_where(
 
 
 def fix_open_paren_indent_after_lone_from(lines: List[str]) -> List[str]:
-    """二次子查询对齐后，若 ``from`` / 独占 ``join`` 的下一行仅为 ``(``，将 ``(`` 与上一关键字行首同列。
+    """若 ``from`` / 独占 ``join`` 的下一行仅为 ``(``，将 ``(`` 与上一关键字行首同列。
 
-    避免第二轮 ``align_subquery_brackets`` 在子块首行 ``(`` 上误用较大 ``target_indent`` 的回归。
+    同时将 ``(`` 到配对 ``)`` 之间的子查询体整体偏移相同列差，并对齐 ``)``。
     """
     if not lines:
         return lines
-    out: List[str] = []
-    for i, line in enumerate(lines):
-        if i > 0 and line.strip() == "(":
-            prev = lines[i - 1]
-            pst = prev.strip()
-            pst_l = pst.lower()
-            if pst_l == "from" or _JOIN_ONLY_LINE_RE.match(pst):
-                fl = len(prev) - len(prev.lstrip())
-                nl = line.endswith("\n")
-                out.append(" " * fl + "(" + ("\n" if nl else ""))
-                continue
-        out.append(line)
+    out = list(lines)
+    i = 1
+    while i < len(out):
+        line = out[i]
+        if line.strip() != "(":
+            i += 1
+            continue
+        prev = out[i - 1]
+        pst = prev.strip()
+        pst_l = pst.lower()
+        if not (pst_l == "from" or _JOIN_ONLY_LINE_RE.match(pst)):
+            i += 1
+            continue
+        kw_lead = len(prev) - len(prev.lstrip())
+        old_lead = len(line) - len(line.lstrip())
+        delta = kw_lead - old_lead
+        if delta != 0:
+            nl = line.endswith("\n")
+            out[i] = " " * kw_lead + "(" + ("\n" if nl else "")
+        depth = 1
+        j = i + 1
+        while j < len(out) and depth > 0:
+            sj = out[j].strip()
+            pd = _paren_delta_ignore_strings_sq(out[j])
+            depth += pd
+            if depth <= 0 and re.match(r"^\)", sj):
+                old_j = len(out[j]) - len(out[j].lstrip())
+                if old_j != kw_lead or delta != 0:
+                    nlj = out[j].endswith("\n")
+                    out[j] = " " * kw_lead + sj + ("\n" if nlj else "")
+                break
+            if delta != 0:
+                old_j = len(out[j]) - len(out[j].lstrip())
+                new_j = max(0, old_j + delta)
+                nlj = out[j].endswith("\n")
+                out[j] = " " * new_j + sj + ("\n" if nlj else "")
+            j += 1
+        if delta != 0:
+            i = j + 1
+        else:
+            i += 1
     return out
 
 
@@ -1108,7 +1153,9 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
 
     第一层内相对缩进以首条 ``select``/``group by`` 行行首为参照，避免 ``when``/``else``/``end`` 参与 min 拉低整块。
 
-    递归处理嵌套的子查询
+    递归处理嵌套的子查询（递归体为单遍 ``_align_subquery_brackets_pass``）。
+
+    **单次对外调用内部**重复单遍处理直至不再变化，以合并原预处理中连续多轮 ``align_subquery_brackets`` 的收敛因果。
 
     ⚠️ 重要：必须保证SQL语法完整性，不能删除任何关键字
     边界情况：
@@ -1116,9 +1163,20 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
     - 括号和内容同行：left join\n(select... → 必须保留select！（2026-04-08 修复）
     - FROM 子查询：from\n(\n    select... → 同样处理
     - FROM/JOIN和括号同行：from (\n    select... → 先拆分成两行再处理
-
-    【2026-04-11 修复】增加二次扫描机制，确保所有子查询都被处理
     """
+    if not lines:
+        return lines
+    out = lines
+    for _ in range(_ALIGN_SUBQUERY_BRACKETS_MAX_STABLE):
+        nxt = _align_subquery_brackets_pass(out)
+        if nxt == out:
+            return nxt
+        out = nxt
+    return out
+
+
+def _align_subquery_brackets_pass(lines: List[str]) -> List[str]:
+    """单遍子查询括号对齐；由 ``align_subquery_brackets`` 迭代至稳定调用。"""
     # 第一步：预处理 - 将 FROM/JOIN 后的括号拆分到新行
     preprocessed_lines = []
     for line in lines:
@@ -1143,6 +1201,24 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
             preprocessed_lines.append(bracket_line)
         else:
             preprocessed_lines.append(line)
+
+    def _indent_inner_body_after_prev_lone_paren(
+        subq: List[str], end_idx: int
+    ) -> Optional[int]:
+        """自 ``end_idx-1`` 起向上：遇 ``) as`` 即停（勿跨已闭合子查询）；命中独占 ``(`` 则 ``(`` 列 + ``SUBQUERY_INDENT``。"""
+        j = end_idx - 1
+        while j >= 0:
+            raw0 = subq[j].split("\n", 1)[0]
+            st = raw0.strip()
+            if not st or st.startswith("--"):
+                j -= 1
+                continue
+            if re.match(r"^\)\s+as\b", st, re.I):
+                return None
+            if st == "(":
+                return len(subq[j]) - len(subq[j].lstrip(" \t")) + SUBQUERY_INDENT
+            j -= 1
+        return None
 
     # 第二步：正常处理子查询括号
     new_lines = []
@@ -1224,8 +1300,8 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
                         subquery_lines.append(inner_line)
                         i += 1
 
-                    # 递归处理子查询中的嵌套JOIN
-                    processed_subquery = align_subquery_brackets(subquery_lines)
+                    # 递归处理子查询中的嵌套JOIN（单遍，避免与外层「迭代至稳定」重复套叠）
+                    processed_subquery = _align_subquery_brackets_pass(subquery_lines)
 
                     # 调整子查询的基础缩进（保留相对缩进）
                     if processed_subquery:
@@ -1339,14 +1415,27 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
                                         _prev_ln = processed_subquery[idx - 1]
                                         _pst = _prev_ln.strip()
                                         if _pst.lower() == "from":
-                                            _fi = idx - 1
-                                            _al_paren = (
-                                                _clause_indent_from_prior_select_only_list(
-                                                    processed_subquery, _fi, target_indent
+                                            # 从 ``new_lines`` 取刚写入的 ``from`` 已调整后缩进，
+                                            # 避免从递归未调整的 ``processed_subquery`` 查 select 得到陈旧值。
+                                            _from_in_new = None
+                                            for _bk in range(len(new_lines) - 1, -1, -1):
+                                                _bs = new_lines[_bk].strip().lower()
+                                                if not _bs or _bs.startswith("--"):
+                                                    continue
+                                                if _bs == "from":
+                                                    _from_in_new = len(new_lines[_bk]) - len(new_lines[_bk].lstrip())
+                                                break
+                                            if _from_in_new is not None:
+                                                _paren_lead = _from_in_new
+                                            else:
+                                                _fi = idx - 1
+                                                _al_paren = (
+                                                    _clause_indent_from_prior_select_only_list(
+                                                        processed_subquery, _fi, target_indent
+                                                    )
                                                 )
-                                            )
-                                            if _al_paren is not None:
-                                                _paren_lead = _al_paren
+                                                if _al_paren is not None:
+                                                    _paren_lead = _al_paren
                                         elif _JOIN_ONLY_LINE_RE.match(_pst):
                                             _paren_lead = len(_prev_ln) - len(
                                                 _prev_ln.lstrip()
@@ -1366,13 +1455,13 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
                                 bracket_depth += 1
                                 continue
                             elif re.match(r'^\s*\)', subline):
-                                if paren_col_stack:
-                                    paren_col_stack.pop()
+                                _popped_col = paren_col_stack.pop() if paren_col_stack else base_indent
                                 bracket_depth -= 1
                                 has_newline = subline.endswith('\n')
-                                # 右括号：与对应左括号同列（``base_indent``），勿用 ``target_indent``（否则 ``) as`` 会多一档）
+                                # 右括号：与对应左括号同列；外层由 closing_bracket_line 单独处理，
+                                # 此处仅涉及内容内部嵌套子查询的 `)` — 用 _popped_col 而非 base_indent
                                 if bracket_depth == 0:
-                                    new_inner_line = ' ' * base_indent + subline_stripped
+                                    new_inner_line = ' ' * _popped_col + subline_stripped
                                 else:
                                     new_inner_line = subline.rstrip('\n')
                                 if has_newline:
@@ -1388,7 +1477,8 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
                                 if bracket_depth == 0:
                                     # SQL关键字行（FROM/WHERE等）直接使用target_indent
                                     is_sql_keyword = re.match(r'^(from|where|group\s+by|having|order\s+by|limit|union|left\s+join|right\s+join|inner\s+join|join|on|and|or)\b', subline_stripped, re.IGNORECASE)
-                                    # ``) as alias`` 下一行的 ``join``/``on``：与同层 ``from``/``join`` 同列；否则与 ``)`` 同列
+                                    # ``) as alias`` 下一行的 **独占** ``join``/``on``：与同层 ``from``/``join`` 同列；否则与 ``)`` 同列
+                                    # 注意：仅匹配独占一行的 join 关键字，避免 ``left join table as b`` 被误推到外层缩进
                                     if (
                                         idx > 0
                                         and is_sql_keyword
@@ -1398,10 +1488,8 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
                                             re.IGNORECASE,
                                         )
                                         and (
-                                            re.search(
-                                                r"\bjoin\b",
-                                                subline_stripped,
-                                                re.IGNORECASE,
+                                            _JOIN_ONLY_LINE_RE.match(
+                                                subline_stripped
                                             )
                                             or re.match(
                                                 r"^on\b",
@@ -1496,7 +1584,7 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
                                                     processed_subquery, idx, target_indent
                                                 )
                                             )
-                                            if _al0 is not None:
+                                            if _al0 is not None and _al0 >= target_indent:
                                                 new_inner_line = (
                                                     " " * _al0 + subline_stripped
                                                 )
@@ -1511,7 +1599,7 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
                                             _wsel = _leading_indent_enclosing_select_before(
                                                 processed_subquery, idx
                                             )
-                                            if _wsel is not None:
+                                            if _wsel is not None and _wsel >= target_indent:
                                                 new_inner_line = (
                                                     " " * _wsel + subline_stripped
                                                 )
@@ -1527,7 +1615,7 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
                                             _g0 = _leading_indent_enclosing_select_before(
                                                 processed_subquery, idx
                                             )
-                                            if _g0 is not None:
+                                            if _g0 is not None and _g0 >= target_indent:
                                                 new_inner_line = (
                                                     " " * _g0 + subline_stripped
                                                 )
@@ -1552,9 +1640,17 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
                                                     " " * target_indent + subline_stripped
                                                 )
                                         else:
-                                            new_inner_line = (
-                                                ' ' * target_indent + subline_stripped
+                                            _ej = _leading_indent_enclosing_select_before(
+                                                processed_subquery, idx
                                             )
+                                            if _ej is not None and _ej >= target_indent:
+                                                new_inner_line = (
+                                                    " " * _ej + subline_stripped
+                                                )
+                                            else:
+                                                new_inner_line = (
+                                                    ' ' * target_indent + subline_stripped
+                                                )
                                     elif (
                                         comma_prefix_spaces is not None
                                         and subline_stripped.startswith(',')
@@ -1791,6 +1887,21 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
                                             new_inner_line = (
                                                 " " * _uq_n + subline_stripped
                                             )
+                                        elif (
+                                            idx > 0
+                                            and processed_subquery[idx - 1]
+                                            .split("\n", 1)[0]
+                                            .strip()
+                                            == "("
+                                        ):
+                                            # 独占 ``(`` 下一行首条 ``select``：``(`` 列 + 6（勿依赖可能为空的 paren_col_stack）
+                                            _opc = len(processed_subquery[idx - 1]) - len(
+                                                processed_subquery[idx - 1].lstrip(" \t")
+                                            )
+                                            new_inner_line = (
+                                                " " * (_opc + SUBQUERY_INDENT)
+                                                + subline_stripped
+                                            )
                                         elif _prev_open_paren:
                                             # 已由更内层 ``join (`` 块对齐到更大缩进时，外层勿用较小 ``_ci_kw`` 回写（如 tmp2 的 from 被 6 格覆盖）
                                             if _cur_lead < _ci_kw:
@@ -1833,6 +1944,11 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
                                             )
                                         else:
                                             _al_fix = None
+                                            _ipa_kw = None
+                                            if paren_col_stack:
+                                                _ipa_kw = _indent_inner_body_after_prev_lone_paren(
+                                                    processed_subquery, idx
+                                                )
                                             if re.match(
                                                 r"^union\b",
                                                 subline_stripped,
@@ -1852,13 +1968,20 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
                                                 subline_stripped,
                                                 re.IGNORECASE,
                                             ):
-                                                _al_fix = (
-                                                    _clause_indent_from_prior_select_only_list(
-                                                        processed_subquery,
-                                                        idx,
-                                                        target_indent,
+                                                if _ipa_kw is not None and re.match(
+                                                    r"^from\s+\S",
+                                                    subline_stripped,
+                                                    re.IGNORECASE,
+                                                ):
+                                                    _al_fix = _ipa_kw
+                                                else:
+                                                    _al_fix = (
+                                                        _clause_indent_from_prior_select_only_list(
+                                                            processed_subquery,
+                                                            idx,
+                                                            target_indent,
+                                                        )
                                                     )
-                                                )
                                             elif (
                                                 re.match(
                                                     r"^where\b",
@@ -1867,21 +1990,27 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
                                                 )
                                                 and idx > 0
                                             ):
-                                                _w2 = _leading_indent_enclosing_select_before(
-                                                    processed_subquery, idx
-                                                )
-                                                if _w2 is not None:
-                                                    _al_fix = _w2
+                                                if _ipa_kw is not None:
+                                                    _al_fix = _ipa_kw
+                                                else:
+                                                    _w2 = _leading_indent_enclosing_select_before(
+                                                        processed_subquery, idx
+                                                    )
+                                                    if _w2 is not None:
+                                                        _al_fix = _w2
                                             elif re.match(
                                                 r"^group\s+by\b",
                                                 subline_stripped,
                                                 re.IGNORECASE,
                                             ):
-                                                _gx = _leading_indent_enclosing_select_before(
-                                                    processed_subquery, idx
-                                                )
-                                                if _gx is not None:
-                                                    _al_fix = _gx
+                                                if _ipa_kw is not None:
+                                                    _al_fix = _ipa_kw
+                                                else:
+                                                    _gx = _leading_indent_enclosing_select_before(
+                                                        processed_subquery, idx
+                                                    )
+                                                    if _gx is not None:
+                                                        _al_fix = _gx
                                             elif re.match(
                                                 r"^(having|order\s+by)\b",
                                                 subline_stripped,
@@ -2594,30 +2723,49 @@ def align_union_branch_keyword_column(lines: List[str]) -> List[str]:
         wrap_tgt = _wrap_paren_indent_union_outer_select(out, open_paren_line, anc)
         # 勿把 ``(`` 之上的外层 ``from`` 纳入（``start`` 可能已回退到 from 行）
         rw0 = min(anc, open_paren_line)
+        # 仅改写「最外层 ``(`` … ``) as``」深度为 1 的 ``select``/``from``/``union``；跳过
+        # ``from (`` 内再嵌套的子查询（否则会把已 ``(`` 列 +6 的内层 ``select``/``from`` 拉回与首节 ``select`` 同列）。
+        run = 0
         for k in range(rw0, end_k + 1):
             if k in covered:
                 continue
             raw = out[k]
             st0 = raw.split("\n", 1)[0].strip()
             if not st0 or st0.startswith("--"):
+                run += _paren_delta_ignore_strings_sq(raw)
                 continue
-            if (
-                re.match(r"^(select|from|union)\b", st0, re.I)
-                or re.match(r"^\($", st0)
-                or re.match(r"^\)\s+as\b", st0, re.I)
-            ):
-                has_nl = raw.endswith("\n")
-                use_tgt = tgt
-                if wrap_tgt is not None:
-                    if k == open_paren_line and st0 == "(":
-                        use_tgt = wrap_tgt
-                    elif k == end_k and re.match(r"^\)\s+as\b", st0, re.I):
-                        use_tgt = wrap_tgt
-                out[k] = " " * use_tgt + st0 + ("\n" if has_nl else "")
+            is_kw_chain = re.match(
+                r"^(select|from|union|(?:(?:left|right|inner|full)(?:\s+outer)?\s+)?(?:cross\s+)?join|where|group\s+by|having|order\s+by)\b",
+                st0, re.I,
+            )
+            is_open = st0 == "("
+            is_close_as = bool(re.match(r"^\)\s+as\b", st0, re.I))
+            if is_kw_chain or is_open or is_close_as:
+                depth_before = run
+                do_rewrite = False
+                if is_open:
+                    if k == open_paren_line:
+                        do_rewrite = True
+                elif is_close_as:
+                    if k == end_k:
+                        do_rewrite = True
+                elif is_kw_chain and depth_before == 1:
+                    do_rewrite = True
+                if do_rewrite:
+                    has_nl = raw.endswith("\n")
+                    use_tgt = tgt
+                    if wrap_tgt is not None:
+                        if k == open_paren_line and is_open:
+                            use_tgt = wrap_tgt
+                        elif k == end_k and is_close_as:
+                            use_tgt = wrap_tgt
+                    out[k] = " " * use_tgt + st0 + ("\n" if has_nl else "")
+            run += _paren_delta_ignore_strings_sq(raw)
         for t in range(rw0, end_k + 1):
             covered.add(t)
         i += 1
-    return out
+    # UNION 链改写 ``select``/``from`` 行首列后须重算句首逗号列；因果收进本函数末尾（替代预处理中紧随其后的 ``align_field_names``）。
+    return align_field_names(out)
 
 
 def align_case_when_columns(lines: List[str]) -> List[str]:
@@ -3176,13 +3324,22 @@ def _join_indent_for_close_alias_on(lines: List[str], line_idx: int, left_upto_a
     return _find_nearest_join_indent(lines, line_idx - 1)
 
 
+_CLOSE_PAREN_ALIAS_ON_SQL_KW = frozenset({
+    'as', 'on', 'and', 'or', 'end', 'where', 'group', 'having', 'order',
+    'limit', 'union', 'from', 'select', 'case', 'when', 'then', 'else',
+    'set', 'insert', 'into', 'values', 'update', 'delete', 'create',
+    'drop', 'alter', 'table', 'not', 'in', 'is', 'like', 'between',
+    'exists', 'null', 'true', 'false', 'lateral', 'view', 'over',
+})
+
+
 def _try_split_join_on_one_line(body: str, all_lines: List[str], line_idx: int) -> Optional[Tuple[str, str]]:
-    """若本行含同行 ``… join … on …`` 或 ``) as alias on …``，返回 (首行, 带缩进的 on 行)；否则 None。"""
+    """若本行含同行 ``… join … on …`` 或 ``) [as] alias on …``，返回 (首行, 带缩进的 on 行)；否则 None。"""
     stripped = body.strip()
     if not stripped or stripped.startswith("--"):
         return None
 
-    # 1) 子查询闭合别名同行 on
+    # 1) 子查询闭合别名同行 on（已有 AS）
     m_close = re.match(r"(?i)^(\s*\)\s+as\s+\S+)\s+on\s+(.+)$", body.rstrip("\n"))
     if m_close:
         left = m_close.group(1).rstrip()
@@ -3191,6 +3348,38 @@ def _try_split_join_on_one_line(body: str, all_lines: List[str], line_idx: int) 
             join_indent = len(body) - len(body.lstrip())
         on_line = " " * join_indent + "on " + m_close.group(2).strip()
         return (left, on_line)
+
+    # 1.5) 子查询闭合别名同行 on（缺少 AS）: ") alias on cond" / ")alias on cond" → ") as alias" + "on cond"
+    m_close_no_as = re.match(r"(?i)^(\s*\))\s*(\w+)\s+on\s+(.+)$", body.rstrip("\n"))
+    if m_close_no_as:
+        alias = m_close_no_as.group(2)
+        if alias.lower() not in _CLOSE_PAREN_ALIAS_ON_SQL_KW:
+            close_paren = m_close_no_as.group(1)
+            left = f"{close_paren} as {alias}"
+            join_indent = _join_indent_for_close_alias_on(all_lines, line_idx, left)
+            if join_indent < 0:
+                join_indent = len(body) - len(body.lstrip())
+            on_line = " " * join_indent + "on " + m_close_no_as.group(3).strip()
+            return (left, on_line)
+
+    # 1.6) 子查询闭合别名同行 where（已有 AS）: ") as alias where cond" → ") as alias" + "where cond"
+    m_close_where = re.match(r"(?i)^(\s*\)\s+as\s+\S+)\s+where\s+(.+)$", body.rstrip("\n"))
+    if m_close_where:
+        left = m_close_where.group(1).rstrip()
+        close_indent = len(body) - len(body.lstrip())
+        where_line = " " * close_indent + "where " + m_close_where.group(2).strip()
+        return (left, where_line)
+
+    # 1.7) 子查询闭合别名同行 where（缺少 AS）: ") alias where cond" / ")alias where cond" → ") as alias" + "where cond"
+    m_close_no_as_where = re.match(r"(?i)^(\s*\))\s*(\w+)\s+where\s+(.+)$", body.rstrip("\n"))
+    if m_close_no_as_where:
+        alias = m_close_no_as_where.group(2)
+        if alias.lower() not in _CLOSE_PAREN_ALIAS_ON_SQL_KW:
+            close_paren = m_close_no_as_where.group(1)
+            left = f"{close_paren} as {alias}"
+            close_indent = len(body) - len(body.lstrip())
+            where_line = " " * close_indent + "where " + m_close_no_as_where.group(3).strip()
+            return (left, where_line)
 
     # 2) left join … on …（从行首 join 关键字后扫描深度 0 的 on）
     jm = _JOIN_LINE_START_RE.match(body)
@@ -3208,6 +3397,16 @@ def _try_split_join_on_one_line(body: str, all_lines: List[str], line_idx: int) 
     left = body[:on_pos].rstrip()
     if not left:
         return None
+    # 拆分后为 left 部分补充缺失的 AS（如 "left join t1 alias" → "left join t1 as alias"）
+    m_join_alias = re.match(
+        r'^(\s*(?:left\s+(?:outer\s+)?join|right\s+(?:outer\s+)?join|inner\s+join'
+        r'|full\s+(?:outer\s+)?join|cross\s+join|join)\s+\S+)'
+        r'\s+(\w+)\s*$',
+        left, re.IGNORECASE)
+    if m_join_alias and not re.search(r'(?i)\bas\b', left):
+        alias = m_join_alias.group(2)
+        if alias.lower() not in _CLOSE_PAREN_ALIAS_ON_SQL_KW:
+            left = f"{m_join_alias.group(1)} as {alias}"
     cond = m_on.group(3).strip()
     on_line = " " * join_indent + "on " + cond
     return (left, on_line)
@@ -3480,9 +3679,25 @@ def fix_with_cte_comma_indent(lines: List[str]) -> List[str]:
 def align_field_names(lines: List[str]) -> List[str]:
     """对齐字段名首字母（针对没有AS关键字的字段列表）。
 
+    单次对外调用内部迭代单遍 ``_align_field_names_pass`` 至稳定，以合并原 ``UNION`` 链后再次
+    ``align_field_names`` 的因果（链上改列后逗号列须重算）。
+
     多行 `, … case when … end` 后若单独一行 `) as col`，须在 `)` 行之后才结束 CASE 块扫描，
     否则后续行首逗号不再统一列；见 ``docs/KNOWN_ISSUES.md`` Issue #4。
     """
+    if not lines:
+        return lines
+    out = lines
+    for _ in range(_ALIGN_FIELD_NAMES_MAX_STABLE):
+        nxt = _align_field_names_pass(out)
+        if nxt == out:
+            return nxt
+        out = nxt
+    return out
+
+
+def _align_field_names_pass(lines: List[str]) -> List[str]:
+    """单遍字段名/逗号列对齐；由 ``align_field_names`` 迭代至稳定调用。"""
     new_lines = []
     i = 0
 
@@ -4274,7 +4489,7 @@ def format_sql_file(input_file: str, verify_only: bool = False,
         lines = f.readlines()
 
     print(f"{'='*70}")
-    print(f"SQL 代码对齐工具 v3.1")
+    print(f"SQL 代码对齐工具 v3.1.1")
     print(f"{'='*70}")
     print(f"文件: {input_file}")
     print(f"总行数: {len(lines)}")
@@ -4375,19 +4590,19 @@ def format_sql_file(input_file: str, verify_only: bool = False,
         if join_alias_count > 0:
             print(f"✅ 校正 {join_alias_count} 行子查询闭合后的 join 缩进")
 
+        # 3.03 预拆分 `) alias on/where condition` 确保子查询闭合行干净（须在 align_subquery_brackets 之前）
+        original_lines = lines.copy()
+        lines = split_inline_join_on_lines(lines)
+        pre_split_extra = len(lines) - len(original_lines)
+        if pre_split_extra > 0:
+            print(f"✅ 预拆分 ) alias on/where，新增 {pre_split_extra} 行（为括号对齐做准备）")
+
         # 3. 对齐子查询括号（必须在字段名对齐之前）
         original_lines = lines.copy()
         lines = align_subquery_brackets(lines)
         bracket_count = sum(1 for i in range(len(lines)) if i < len(original_lines) and lines[i] != original_lines[i])
         if bracket_count > 0:
-            print(f"✅ 对齐 {bracket_count} 行子查询括号及内容")
-
-        # 3.01 再跑一轮子查询括号：嵌套块内 ``from``/``where`` 等在首轮 depth 判断下未落 target_indent 时可收敛
-        original_lines = lines.copy()
-        lines = align_subquery_brackets(lines)
-        bracket_count2 = sum(1 for i in range(len(lines)) if i < len(original_lines) and lines[i] != original_lines[i])
-        if bracket_count2 > 0:
-            print(f"✅ 二次对齐子查询括号，调整 {bracket_count2} 行")
+            print(f"✅ 对齐 {bracket_count} 行子查询括号及内容（含内部迭代至稳定）")
 
         original_lines = lines.copy()
         lines = fix_open_paren_indent_after_lone_from(lines)
@@ -4462,14 +4677,23 @@ def format_sql_file(input_file: str, verify_only: bool = False,
         if union_kw_count > 0:
             print(f"✅ 对齐 {union_kw_count} 行 UNION 子链关键字列")
 
-        # 4.556 ``union`` 链会改写链上 ``select``/``from`` 行首列，须在之后重算句首逗号列，否则无 ``AS`` 的续行（如 ``, col``）仍留在旧缩进，破坏规范二之 6/7 条。
+        # 4.556 UNION 链后逗号列重算已收进 ``align_union_branch_keyword_column`` 末尾对 ``align_field_names`` 的调用。
+
+        # 4.557 UNION 链改写 ``from`` 行首列后，``from`` 下一行独占 ``(`` 可能与新 ``from`` 不同列。
         original_lines = lines.copy()
-        lines = align_field_names(lines)
-        union_comma_fix = sum(
-            1 for j in range(len(lines)) if j < len(original_lines) and lines[j] != original_lines[j]
-        )
-        if union_comma_fix > 0:
-            print(f"✅ UNION 链后重对齐 {union_comma_fix} 行 SELECT 逗号列")
+        lines = align_grouping_sets_layout(lines)
+        if lines != original_lines:
+            print("✅ UNION 链后重算 grouping sets 布局")
+
+        original_lines = lines.copy()
+        lines = align_join_after_subquery_close(lines)
+        if lines != original_lines:
+            print("✅ UNION 链后修正 ) as 后 join 缩进")
+
+        original_lines = lines.copy()
+        lines = fix_open_paren_indent_after_lone_from(lines)
+        if lines != original_lines:
+            print("✅ UNION 链后修正 from 下一行括号缩进")
 
         # 5.8 同行 ``join … on`` / ``) as alias on`` 拆成两行（须在 align_where 之前）
         original_lines = lines.copy()
@@ -4490,14 +4714,9 @@ def format_sql_file(input_file: str, verify_only: bool = False,
         lines = align_where_and_clauses(lines)
         where_count = sum(1 for i in range(len(lines)) if i < len(original_lines) and lines[i] != original_lines[i])
         if where_count > 0:
-            print(f"✅ 对齐 {where_count} 行 ON/AND/OR 与 JOIN/WHERE")
+            print(f"✅ 对齐 {where_count} 行 ON/AND/OR 与 JOIN/WHERE（含末尾 CASE 列再收敛）")
 
-        # 6.25 二次 CASE 列对齐：``align_where`` 会把 SELECT 内多行 ``when`` 续行的 ``and``/``or`` 误按 WHERE 缩进，须再收敛
-        original_lines = lines.copy()
-        lines = align_case_when_columns(lines)
-        case_fix2 = sum(1 for i in range(len(lines)) if i < len(original_lines) and lines[i] != original_lines[i])
-        if case_fix2 > 0:
-            print(f"✅ 二次统一 {case_fix2} 行 CASE 块 when/else/end/谓词续行")
+        # 6.25 ``align_where`` 后 CASE 再收敛已收进 ``align_where_and_clauses`` 返回前对 ``align_case_when_columns`` 的调用。
 
         # 6.5 修复子查询闭合括号后 ON 的缩进
         original_lines = lines.copy()

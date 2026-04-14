@@ -1,5 +1,44 @@
 # SQL对齐工具已知问题和解决方案
 
+## Issue #6: `) alias where condition` 同行时别名未加 AS 且 WHERE 未换行 + 缩进级联错误（v3.1.2 修复）
+
+### 现象
+1. 子查询闭合括号、别名、WHERE 条件在同一行时（如 `) a where rn = 1`），别名未补 `as`，`where` 未拆行。
+2. 包含 `) alias where/on condition` 模式的 `from (...)` 子查询，内部内容未正确缩进 +6，`left join` 等关键字被推到错误的缩进层级。
+
+### 根因
+1. `_try_split_join_on_one_line` 仅处理 `on` 关键字（Pattern 1/1.5/2），不处理 `where`。
+2. `add_table_alias_as_keyword` 要求别名在行尾（`\)\s*(\w+)\s*$`），`) alias where ...` 不匹配。
+3. `split_inline_join_on_lines`（步骤 5.8）在 `align_subquery_brackets`（步骤 3）**之后**执行，导致 `align_subquery_brackets` 处理时子查询闭合行仍含 `where/on` 条件，干扰了括号配对和内容缩进。缩进被后续 `align_union_branch_keyword_column` 覆盖，`_lead_join_on_after_close_alias` 基于扭曲的上下文将 `left join` 推到了外层缩进。
+
+### 解决方案
+1. 在 `_try_split_join_on_one_line` 新增 Pattern 1.6（`) as alias where cond`）和 Pattern 1.7（`) alias where cond`），拆为 `) as alias` + `where cond`。
+2. 在 pipeline 中 `align_subquery_brackets` **之前**增加一次 `split_inline_join_on_lines` 预拆分调用（步骤 3.03），确保子查询闭合行干净后再做括号对齐。
+
+### 影响范围
+- 所有 `) alias where condition` 模式的子查询闭合行
+- 包含此类模式的嵌套子查询的缩进级联
+
+---
+
+## Issue #5: `) alias on condition` 同行时别名未加 AS 且 ON 未换行（v3.1.1 修复）
+
+### 现象
+- 子查询闭合括号、别名、ON 条件在同一行时（如 `) pd on nvl(...)`），别名未补 `as`，`on` 未拆行。
+- `left join table alias on condition` 拆行后，别名也未补 `as`（如 `left join jv_data_pre j`）。
+
+### 根因
+- `_try_split_join_on_one_line` Pattern 1 的正则 `\)\s+as\s+\S+` **要求 `as` 已存在**，所以 `) alias on ...` 不匹配。
+- `add_table_alias_as_keyword` Pattern 2 的正则 `\)(\s*)(\w+)\s*$` **要求行尾就是别名**，所以 `) alias on ...` 也不匹配。
+- Pipeline 顺序：`add_table_alias_as_keyword`（步骤 1.5）在 `split_inline_join_on_lines`（步骤 5.8）之前执行，两步互相踏空。
+
+### 处理（v3.1.1）
+- 在 `_try_split_join_on_one_line` 中新增 **Pattern 1.5**：匹配 `^\s*\)\s+(\w+)\s+on\s+(.+)$`（无 `as` 的 `) alias on cond`），拆分时同时补上 `as`，输出 `) as alias` + `on cond`。
+- 对 Pattern 2（`join table alias on`）拆分后的 left 部分，检测缺失 `as` 并补充。
+- 通过 SQL 关键字黑名单 `_CLOSE_PAREN_ALIAS_ON_SQL_KW` 避免将 `end`、`where` 等误判为别名。
+
+---
+
 ## Issue #4: 多行 `sum(case … end ) as col` 之后行首逗号与上一字段不齐（v3.1+ 修复）
 
 ### 现象

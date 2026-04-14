@@ -6,7 +6,8 @@ description: >
   严格保证在原逻辑不变的前提下进行代码规范化。提供自动化Python工具辅助AS对齐和建表语句对齐。
   v3.0：零提问策略 — 格式化请求默认直接执行，不再反复确认。
   v3.1：对齐规范定稿 — ON 一律换行并与 JOIN 同列；WHERE/HAVING/AND/OR；注释「--」与正文整体；工具修复 cast/then 误补 as。
-version: 3.1.0
+  v3.1.1：查询块主子句列与括号层级 +6 写入规范；多轮对齐因果收进单次对外调用内部迭代至稳定。
+version: 3.1.1
 ---
 
 # SQL 代码格式规范化 Skill
@@ -149,7 +150,7 @@ python3 sql_aligner.py file.sql --table-only
 **注意事项**：
 - 工具仅处理对齐，不处理其他格式化（关键字大小写、逗号位置等）
 - 子查询括号内 **`,` 列** 由 `align_subquery_brackets` 与 **`select` / `group by` 首行首字段** 对齐（见 §4.2 第 8 条），避免 `, case` 与 `, expr` 仅因相对缩进差 1 格。
-- 自动对齐可能需要运行 2-3 次才能达到最佳效果
+- 预处理阶段子查询括号、字段逗号列、UNION 后逗号、WHERE 后 CASE 等已在对应函数**单次调用内迭代至稳定**；若仍有个别边界，可再整文件运行一次格式化
 - **AS 与 `sql_aligner.py` 一致**：分档用 `tier_len`（句首 ref→列别名 `as` 前，显示宽度）；组内目标列用 `max(gate_abs_end)+AS_SPACING`；整块单列条件见 §2.2（常量 `SELECT_AS_UNIFY_HEAD_CHAR_SPAN_MAX`）
 - 对于复杂的多行表达式（如嵌套的 CASE WHEN），建议人工复查对齐结果
 
@@ -425,6 +426,20 @@ left join
 on a.user_id = b.user_id
 ;
 
+-- ❌ 禁止：) alias on 同行且缺少 AS
+) pd on nvl(item_name, '空值') = pd.old_product_name
+
+-- ✅ 正确：拆为两行，补充 AS
+) as pd
+on nvl(item_name, '空值') = pd.old_product_name
+
+-- ❌ 禁止：) alias where 同行且缺少 AS
+) a where rn = 1
+
+-- ✅ 正确：拆为两行，补充 AS，where 与 ) 同列
+) as a
+where rn = 1
+
 -- ✅ having 与首条件同行；and 与 having 同列
 select type
      , count(*) as cnt
@@ -437,7 +452,21 @@ and sum(amount) > 0
 
 **关键要点**：
 - **禁止** `join ... on ...` 单行省略换行（无「短条件例外」）
+- **禁止** `) alias on ...` 同行写法——子查询闭合括号后的别名和 `on` 必须拆为 `) as alias` + 换行 `on`（工具 `_try_split_join_on_one_line` Pattern 1.5 自动处理）
+- **禁止** `) alias where ...` 同行写法——子查询闭合括号后的别名和 `where` 必须拆为 `) as alias` + 换行 `where`（工具 Pattern 1.6/1.7 自动处理）
 - `on` / `where` / `having` / 块内 `and`/`or` 列对齐关系见上；`having` 与 `where` **各自**作为本块首关键字，**不要**把 `having` 后的 `and` 去对齐 `where`
+
+#### 2.4.1 查询块主子句关键字列与括号层级（MUST，与 `sql_aligner.py` 文件头「三（续）」一致）
+
+**查询块**：同一嵌套层级、由同一套 `select … from …` 及后续同层子句（`where`、`group by`、`having`、`order by`、`limit`、`lateral view`、各类 `join`、`union` / `union all` 等）构成的连续结构；**子查询**被一对独占行的 `(` `)` 包裹时，块边界为左括号下一行至匹配右括号之前（与 §4.2 协同）。
+
+**主子句竖线**：同一块内，上述主子句关键字行首宜与同块 `from` / `join` 等**主句列**垂直对齐（与上文 §2.4 **3.** 一致；嵌套块内单独一套列锚）。
+
+**括号层级**：从左 `(` 下一行起至匹配 `)` 之前，相对该 `(` 所在列整体右移 **6** 个空格（`SUBQUERY_INDENT`）；内层再套子查询则相对**本层**开括号再右移 6；闭括号 `)` 与开括号 `(` 同列（与 §4.2、§2.4 **7.** 一致）。
+
+**优先级**：与 §2.3 **嵌套 CASE 列锚**冲突时，**CASE 列锚优先**，不得为迁就主子句列而平移子 `case`/`when` 锚点。
+
+**工具行为**：`sql_aligner.py` 中 `align_subquery_brackets`、`align_field_names` 对外**单次调用**内部迭代单遍处理直至稳定；`align_union_branch_keyword_column` 返回前调用 `align_field_names`；`align_where_and_clauses` 返回前调用 `align_case_when_columns`，以合并原预处理流水线中「连续多轮同名函数」的因果，**不改变**各步骤之间的依赖顺序与最终收敛意图。
 
 #### 2.5 建表语句对齐
 

@@ -67,6 +67,7 @@ SQL 代码对齐工具 v3.1.1
 * 后续字段逗号后的首字符与第一个字段首字母对齐
 * 子查询括号单独占行
 * 子查询内容相对括号缩进 6 个空格
+* 函数参数折行：续行句首为逗号时，逗号对齐到函数名最后一个字符列；不以逗号或 ``)`` 开头时，对齐到 ``(`` 后第一个非空字符列
 * 同一查询块内主子句关键字列、括号层级 +6 与 **三（续）** 一致；与 CASE 列锚冲突时 CASE 优先
 * ``align_subquery_brackets`` / ``align_field_names`` / ``align_union_branch_keyword_column`` / ``align_where_and_clauses`` 对外单次调用内部迭代至稳定，替代原预处理中连续多轮同名调用
 * 所有规则递归生效
@@ -91,7 +92,7 @@ import unicodedata
 from typing import List, Tuple, Dict, Set, Optional
 from collections import defaultdict
 
-USE_CHAR_MODE = False
+USE_CHAR_MODE = True
 CJK_WIDTH_RATIO = 2.0
 
 SHORT_FIELD_MAX = 50
@@ -127,6 +128,44 @@ def get_width(s: str) -> float:
     return width
 
 
+def _try_insert_as_keyword(line: str, prefix: str, sql_keywords: set) -> Optional[str]:
+    """尝试在字段行中补充缺失的 AS 关键字，返回新行或 None（无需修改）。"""
+    if re.search(r'(?i)\bcase\b', line) or re.search(r'(?i)\bwhen\b.+\bthen\b', line):
+        return None
+
+    code_part = line
+    comment_part = ''
+    cm = re.search(r'\s+--|(?<=\w)--', line)
+    if cm:
+        code_part = line[:cm.start()]
+        comment_part = line[cm.start():]
+    if comment_part.endswith('\n'):
+        comment_part = comment_part[:-1]
+    code_stripped = code_part.rstrip()
+
+    if re.search(r'\s+as\s+\w+\s*$', code_stripped, re.IGNORECASE):
+        return None
+
+    match = re.match(r'^(' + re.escape(prefix) + r')(.*?)(\s+)(\w+)$', code_stripped)
+    if not match:
+        return None
+    field_expr = match.group(2)
+    spaces = match.group(3)
+    alias = match.group(4)
+    if not field_expr.strip():
+        return None
+    if alias.lower() in sql_keywords or alias.isdigit():
+        return None
+    if field_expr.strip() == alias:
+        return None
+
+    has_newline = line.endswith('\n')
+    new_line = f"{match.group(1)}{field_expr}{spaces}as {alias}{comment_part}"
+    if has_newline:
+        new_line += '\n'
+    return new_line
+
+
 def add_missing_as_keywords(lines: List[str]) -> List[str]:
     """自动补充SELECT字段中缺失的AS关键字"""
     new_lines = []
@@ -140,10 +179,12 @@ def add_missing_as_keywords(lines: List[str]) -> List[str]:
             new_lines.append(line)
             continue
 
-        # 检测SELECT块的开始
-        if re.match(r'^\s*select\s+', line, re.IGNORECASE):
+        # 检测SELECT块的开始——同时对 select 首行做 AS 补充
+        select_match = re.match(r'^(\s*select\s+)', line, re.IGNORECASE)
+        if select_match:
             in_select_block = True
-            new_lines.append(line)
+            result = _try_insert_as_keyword(line, select_match.group(1), sql_keywords)
+            new_lines.append(result if result else line)
             continue
 
         # 检测SELECT块的结束（遇到FROM, WHERE等关键字）
@@ -157,43 +198,10 @@ def add_missing_as_keywords(lines: List[str]) -> List[str]:
 
         # 只处理SELECT块内的逗号开头字段
         if is_comma_field and in_select_block:
-            if re.search(r'\s+as\s+\w+', line, re.IGNORECASE):
-                new_lines.append(line)
-                continue
-
-            # 含 CASE/WHEN/THEN 的行不得用行尾「单词」推断列别名，否则会误插成 then as col
-            if re.search(r'(?i)\bcase\b', line) or re.search(r'(?i)\bwhen\b.+\bthen\b', line):
-                new_lines.append(line)
-                continue
-
-            match = re.match(r'^(\s*,\s*)(.*?)(\s+)(\w+)(\s*)$', line)
-            if match:
-                prefix = match.group(1)
-                field_expr = match.group(2)
-                spaces = match.group(3)
-                alias = match.group(4)
-                trailing = match.group(5)
-
-                # 如果字段表达式为空，说明只有字段名，不是别名场景，跳过
-                if not field_expr.strip():
-                    new_lines.append(line)
-                    continue
-
-                if alias.lower() in sql_keywords or alias.isdigit():
-                    new_lines.append(line)
-                    continue
-
-                if field_expr.strip() == alias:
-                    new_lines.append(line)
-                    continue
-
-                has_newline = line.endswith('\n')
-                new_line = f"{prefix}{field_expr}{spaces}as {alias}{trailing}"
-                if has_newline and not new_line.endswith('\n'):
-                    new_line += '\n'
-                new_lines.append(new_line)
-            else:
-                new_lines.append(line)
+            comma_prefix_match = re.match(r'^(\s*,\s*)', line)
+            prefix = comma_prefix_match.group(1) if comma_prefix_match else ''
+            result = _try_insert_as_keyword(line, prefix, sql_keywords)
+            new_lines.append(result if result else line)
         else:
             new_lines.append(line)
 
@@ -354,6 +362,129 @@ def remove_empty_lines(lines: List[str]) -> List[str]:
     return [line for line in lines if line.strip() != '']
 
 
+_NON_FUNC_KEYWORDS = frozenset({
+    'in', 'not', 'exists', 'any', 'all', 'some',
+    'and', 'or', 'on', 'when', 'then', 'else',
+    'where', 'from', 'select', 'as', 'by', 'between',
+    'like', 'is', 'case', 'end', 'into', 'set',
+    'having', 'order', 'group', 'limit', 'union',
+    'values', 'insert', 'update', 'delete', 'create',
+    'alter', 'drop', 'table', 'join', 'left', 'right',
+    'inner', 'outer', 'cross', 'full', 'with', 'over',
+})
+
+
+def align_function_arg_continuations(lines: List[str]) -> List[str]:
+    """函数参数折行对齐。
+
+    当函数调用的参数跨多行时，续行按如下规则对齐：
+
+    * 续行句首为逗号 ``,``：逗号对齐到**函数名最后一个字符**所在列。
+    * 续行句首不是逗号也不是 ``)``：对齐到函数名后第一个 ``(`` 之后的**第一个非空字符**所在列。
+    * 续行句首为 ``)``：不处理，交给 ``align_cross_line_parens`` 现有逻辑。
+
+    仅作用于「函数调用」括号（``identifier(``），不作用于子查询 / ``IN`` / ``EXISTS`` 等非函数括号。
+    """
+    if not lines:
+        return lines
+
+    _CASE_WHEN_KW_RE = re.compile(r'^(and|or|then|when|else|end)\b', re.I)
+
+    out: List[str] = []
+    bracket_stack: List[dict] = []
+    case_depth = 0
+
+    for line in lines:
+        has_nl = line.endswith('\n')
+        raw = line.rstrip('\n')
+        stripped = raw.strip()
+
+        realigned = raw
+        if bracket_stack and stripped and not stripped.startswith('--') and not stripped.startswith(')'):
+            top = bracket_stack[-1]
+            if top['type'] == 'func':
+                # CASE WHEN 内部的 and/or/then/when/else/end 不作为函数参数续行重对齐
+                _skip_for_case = case_depth > 0 and bool(_CASE_WHEN_KW_RE.match(stripped))
+                if not _skip_for_case:
+                    if stripped.startswith(','):
+                        target_col = top['func_last_col']
+                    else:
+                        target_col = top['first_arg_col']
+                    cur_indent = len(raw) - len(raw.lstrip())
+                    if cur_indent != target_col:
+                        realigned = ' ' * target_col + stripped
+
+        out.append(realigned + ('\n' if has_nl else ''))
+
+        parse = realigned
+        in_sq = False
+        i = 0
+        while i < len(parse):
+            ch = parse[i]
+            if ch == "'" and not in_sq:
+                in_sq = True
+                i += 1
+                continue
+            if ch == "'" and in_sq:
+                if i + 1 < len(parse) and parse[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = False
+                i += 1
+                continue
+            if in_sq:
+                i += 1
+                continue
+            if ch == '-' and i + 1 < len(parse) and parse[i + 1] == '-':
+                break
+
+            if ch == '(':
+                is_func = False
+                if i > 0 and (parse[i - 1].isalnum() or parse[i - 1] == '_'):
+                    j = i - 1
+                    while j > 0 and (parse[j - 1].isalnum() or parse[j - 1] == '_'):
+                        j -= 1
+                    func_name = parse[j:i].lower()
+                    if func_name not in _NON_FUNC_KEYWORDS:
+                        is_func = True
+
+                if is_func:
+                    func_last_col = i - 1
+                    fa = i + 1
+                    while fa < len(parse) and parse[fa] == ' ':
+                        fa += 1
+                    if fa >= len(parse) or parse[fa] in (')', '-'):
+                        first_arg_col = i + 1
+                    else:
+                        first_arg_col = fa
+                    bracket_stack.append({
+                        'type': 'func',
+                        'func_last_col': func_last_col,
+                        'first_arg_col': first_arg_col,
+                    })
+                else:
+                    bracket_stack.append({
+                        'type': 'other',
+                        'func_last_col': 0,
+                        'first_arg_col': 0,
+                    })
+
+            elif ch == ')':
+                if bracket_stack:
+                    bracket_stack.pop()
+
+            i += 1
+
+        # 维护 CASE WHEN 深度
+        _lower = realigned.lower()
+        case_depth += len(re.findall(r'\bcase\s+when\b', _lower))
+        case_depth -= len(re.findall(r'\bend\b', _lower))
+        if case_depth < 0:
+            case_depth = 0
+
+    return out
+
+
 def _first_meaningful_char_col(line: str) -> int:
     """整行 ``--`` 注释对齐用参考列（0-based）。
 
@@ -465,11 +596,18 @@ def add_table_alias_as_keyword(lines: List[str]) -> List[str]:
             line,
             re.IGNORECASE
         )
+        _table_alias_sql_kw = {'select', 'case', 'when', 'then', 'else', 'end',
+                               'where', 'and', 'or', 'on', 'set', 'into', 'values',
+                               'group', 'order', 'having', 'limit', 'union', 'lateral'}
         if from_join_match:
             indent = from_join_match.group(1)
             keyword = from_join_match.group(2)
             table_name = from_join_match.group(3)
             alias = from_join_match.group(4)
+
+            if table_name.startswith('(') or alias.lower() in _table_alias_sql_kw:
+                new_lines.append(line)
+                continue
 
             # 检查是否已经有 AS
             if not re.search(r'\bas\b', line, re.IGNORECASE):
@@ -589,6 +727,26 @@ def merge_first_field_to_select(lines: List[str]) -> List[str]:
     while i < len(lines):
         line = lines[i]
         stripped = line.strip()
+
+        # 检测 GROUP BY / ORDER BY 关键字（单独一行，后面无字段）
+        gb_match = re.match(r'^(\s*)(group\s+by|order\s+by)\s*$', line, re.IGNORECASE)
+        if gb_match:
+            kw_indent = len(gb_match.group(1))
+            kw_line = line.rstrip('\n')
+            if i + 1 < len(lines):
+                next_line = lines[i + 1]
+                next_stripped = next_line.strip()
+                if next_stripped and not next_stripped.startswith('--'):
+                    has_newline = next_line.endswith('\n')
+                    merged_line = kw_line + ' ' + next_stripped
+                    if has_newline:
+                        merged_line += '\n'
+                    new_lines.append(merged_line)
+                    i += 2
+                    continue
+            new_lines.append(line)
+            i += 1
+            continue
 
         # 检测 SELECT 关键字（单独一行）
         if re.match(r'^\s*select\s*$', line, re.IGNORECASE):
@@ -1175,32 +1333,42 @@ def align_subquery_brackets(lines: List[str]) -> List[str]:
     return out
 
 
+def split_from_join_open_paren(lines: List[str]) -> List[str]:
+    """将 ``from (`` / ``join (`` / ``from (select ...`` 等拆为独立行。"""
+    result: List[str] = []
+    for line in lines:
+        m1 = re.match(
+            r"^(\s*)(from|left\s+join|right\s+join|inner\s+join|cross\s+join|join)\s+\(\s*$",
+            line, re.IGNORECASE,
+        )
+        if m1:
+            indent, kw = m1.group(1), m1.group(2)
+            suf = '\n' if line.endswith('\n') else ''
+            result.append(indent + kw + suf)
+            result.append(indent + '(' + suf)
+            continue
+        m2 = re.match(
+            r"^(\s*)(from|left\s+join|right\s+join|inner\s+join|cross\s+join|join)\s+\((.+)$",
+            line, re.IGNORECASE,
+        )
+        if m2:
+            indent, kw, content = m2.group(1), m2.group(2), m2.group(3)
+            has_nl = line.endswith('\n')
+            if has_nl and content.endswith('\n'):
+                content = content[:-1]
+            suf = '\n' if has_nl else ''
+            result.append(indent + kw + suf)
+            result.append(indent + '(' + suf)
+            result.append(' ' * (len(indent) + SUBQUERY_INDENT) + content.lstrip() + suf)
+            continue
+        result.append(line)
+    return result
+
+
 def _align_subquery_brackets_pass(lines: List[str]) -> List[str]:
     """单遍子查询括号对齐；由 ``align_subquery_brackets`` 迭代至稳定调用。"""
     # 第一步：预处理 - 将 FROM/JOIN 后的括号拆分到新行
-    preprocessed_lines = []
-    for line in lines:
-        stripped = line.strip()
-        # 检测 FROM/JOIN 后直接跟括号的情况 (如 "from (" 或 "left join (")
-        match = re.match(
-            r"^(\s*)(from|left\s+join|right\s+join|inner\s+join|cross\s+join|join)\s+\(\s*$",
-            line,
-            re.IGNORECASE,
-        )
-        if match:
-            indent = match.group(1)
-            keyword = match.group(2)
-            has_newline = line.endswith('\n')
-            # 拆分成两行
-            keyword_line = indent + keyword
-            bracket_line = indent + '('
-            if has_newline:
-                keyword_line += '\n'
-                bracket_line += '\n'
-            preprocessed_lines.append(keyword_line)
-            preprocessed_lines.append(bracket_line)
-        else:
-            preprocessed_lines.append(line)
+    preprocessed_lines = split_from_join_open_paren(lines)
 
     def _indent_inner_body_after_prev_lone_paren(
         subq: List[str], end_idx: int
@@ -1234,8 +1402,37 @@ def _align_subquery_brackets_pass(lines: List[str]) -> List[str]:
             line,
             re.IGNORECASE,
         )
-        if _from_join_only or _CTE_AS_OPEN_HEAD_RE.match(line):
+        # 补充 CTE 匹配：逗号独占一行 + 可能有注释 + ``cte_name as`` 独占一行
+        _cte_match = _CTE_AS_OPEN_HEAD_RE.match(line)
+        if not _cte_match and not _from_join_only and re.match(
+            r"^\s*\w+\s+as\s*$", line, re.IGNORECASE
+        ):
+            for _bk_cte in range(len(new_lines) - 1, -1, -1):
+                _bk_cte_s = new_lines[_bk_cte].strip()
+                if not _bk_cte_s or _bk_cte_s.startswith("--"):
+                    continue
+                if _bk_cte_s == ",":
+                    _cte_match = True
+                break
+        if _from_join_only or _cte_match:
             base_indent = len(line) - len(line.lstrip())
+            # 递归层中 from/join 原始缩进可能过浅（如 UNION 分支内的 from 未被上层调整）。
+            # 从 new_lines 中取最近同层 select 行首缩进作为纠正参照。
+            if _from_join_only and new_lines:
+                _sel_ind_ref = None
+                for _bk in range(len(new_lines) - 1, -1, -1):
+                    _bks = new_lines[_bk].strip().lower()
+                    if not _bks or _bks.startswith("--"):
+                        continue
+                    if _bks.startswith("select"):
+                        _sel_ind_ref = len(new_lines[_bk]) - len(new_lines[_bk].lstrip())
+                        break
+                    if re.match(r"^(union|from|\(|\))", _bks):
+                        break
+                if _sel_ind_ref is not None and _sel_ind_ref > base_indent:
+                    has_nl = line.endswith("\n")
+                    line = " " * _sel_ind_ref + line.strip() + ("\n" if has_nl else "")
+                    base_indent = _sel_ind_ref
             new_lines.append(line)
             i += 1
 
@@ -1291,14 +1488,56 @@ def _align_subquery_brackets_pass(lines: List[str]) -> List[str]:
                                 break
 
                         # 检测内嵌的左括号
+                        _depth_before = bracket_depth
                         if '(' in inner_stripped:
                             bracket_depth += inner_stripped.count('(')
                         if ')' in inner_stripped and not re.match(r'^\s*\)\s*\w*', inner_line):
                             bracket_depth -= inner_stripped.count(')')
 
-                        # 收集子查询行
-                        subquery_lines.append(inner_line)
-                        i += 1
+                        if bracket_depth <= 0 and _depth_before > 0:
+                            _sd = _depth_before
+                            _in_sq = False
+                            _split_pos = -1
+                            _raw = inner_line.rstrip('\n')
+                            _ci = 0
+                            while _ci < len(_raw):
+                                _ch = _raw[_ci]
+                                if _in_sq:
+                                    if _ch == "'" and _ci + 1 < len(_raw) and _raw[_ci + 1] == "'":
+                                        _ci += 2
+                                        continue
+                                    if _ch == "'":
+                                        _in_sq = False
+                                    _ci += 1
+                                    continue
+                                if _ch == "'":
+                                    _in_sq = True
+                                    _ci += 1
+                                    continue
+                                if _ch == '(':
+                                    _sd += 1
+                                elif _ch == ')':
+                                    _sd -= 1
+                                    if _sd == 0:
+                                        _split_pos = _ci
+                                        break
+                                _ci += 1
+                            if _split_pos >= 0:
+                                has_nl = inner_line.endswith('\n')
+                                content_part = inner_line[:_split_pos].rstrip()
+                                closing_part = inner_line[_split_pos:].rstrip('\n').strip()
+                                if content_part.strip():
+                                    subquery_lines.append(content_part + ('\n' if has_nl else ''))
+                                closing_bracket_line = closing_part + ('\n' if has_nl else '')
+                                i += 1
+                                break
+                            else:
+                                subquery_lines.append(inner_line)
+                                i += 1
+                        else:
+                            # 收集子查询行
+                            subquery_lines.append(inner_line)
+                            i += 1
 
                     # 递归处理子查询中的嵌套JOIN（单遍，避免与外层「迭代至稳定」重复套叠）
                     processed_subquery = _align_subquery_brackets_pass(subquery_lines)
@@ -1444,7 +1683,17 @@ def _align_subquery_brackets_pass(lines: List[str]) -> List[str]:
                                         " " * _paren_lead + subline_stripped
                                     )
                                 else:
-                                    new_inner_line = subline.rstrip('\n')
+                                    # 嵌套层 (：如果前一行 new_lines 中的 from/join 已被调整到更大缩进，
+                                    # ( 应与之同列而非保留旧缩进
+                                    _nest_paren_ind = None
+                                    if subline_stripped == "(" and new_lines:
+                                        _prev_nls = new_lines[-1].strip().lower()
+                                        if _prev_nls == "from" or _JOIN_ONLY_LINE_RE.match(new_lines[-1].strip()):
+                                            _nest_paren_ind = len(new_lines[-1]) - len(new_lines[-1].lstrip())
+                                    if _nest_paren_ind is not None:
+                                        new_inner_line = " " * _nest_paren_ind + subline_stripped
+                                    else:
+                                        new_inner_line = subline.rstrip('\n')
                                 if has_newline:
                                     new_inner_line += '\n'
                                 new_lines.append(new_inner_line)
@@ -1501,6 +1750,10 @@ def _align_subquery_brackets_pass(lines: List[str]) -> List[str]:
                                         _lja = _lead_join_on_after_close_alias(
                                             processed_subquery, idx
                                         )
+                                        # _lja 基于 processed_subquery（旧缩进），
+                                        # 外层 rewrite 可能已将 from 调整到 target_indent；兜底确保 join 不低于 target_indent
+                                        if _lja is not None and _lja < target_indent:
+                                            _lja = target_indent
                                         if _lja is not None:
                                             new_inner_line = (
                                                 " " * _lja + subline_stripped
@@ -1511,6 +1764,8 @@ def _align_subquery_brackets_pass(lines: List[str]) -> List[str]:
                                             ) - len(
                                                 processed_subquery[idx - 1].lstrip()
                                             )
+                                            if _cj_join < target_indent:
+                                                _cj_join = target_indent
                                             new_inner_line = (
                                                 " " * _cj_join + subline_stripped
                                             )
@@ -1884,6 +2139,9 @@ def _align_subquery_brackets_pass(lines: List[str]) -> List[str]:
                                             )
                                         )
                                         if _uq_n is not None:
+                                            # 递归结果中 union 的旧缩进可能 < 当前层基准，用 _ci_kw 兜底
+                                            if _uq_n < _ci_kw:
+                                                _uq_n = _ci_kw
                                             new_inner_line = (
                                                 " " * _uq_n + subline_stripped
                                             )
@@ -1894,9 +2152,14 @@ def _align_subquery_brackets_pass(lines: List[str]) -> List[str]:
                                             .strip()
                                             == "("
                                         ):
-                                            # 独占 ``(`` 下一行首条 ``select``：``(`` 列 + 6（勿依赖可能为空的 paren_col_stack）
-                                            _opc = len(processed_subquery[idx - 1]) - len(
-                                                processed_subquery[idx - 1].lstrip(" \t")
+                                            # 独占 ``(`` 下一行首条 ``select``：``(`` 列 + 6
+                                            # 从 new_lines 取已调整后的 ( 缩进（嵌套层 ( 可能已被纠正）
+                                            _opc = len(new_lines[-1]) - len(
+                                                new_lines[-1].lstrip(" \t")
+                                            ) if new_lines and new_lines[-1].strip() == "(" else (
+                                                len(processed_subquery[idx - 1]) - len(
+                                                    processed_subquery[idx - 1].lstrip(" \t")
+                                                )
                                             )
                                             new_inner_line = (
                                                 " " * (_opc + SUBQUERY_INDENT)
@@ -1938,6 +2201,9 @@ def _align_subquery_brackets_pass(lines: List[str]) -> List[str]:
                                             _ljn_peer = _lead_join_on_after_close_alias(
                                                 processed_subquery, idx
                                             )
+                                        # 旧缩进可能低于当前嵌套层基准，兜底到 _ci_kw
+                                        if _ljn_peer is not None and _ljn_peer < _ci_kw:
+                                            _ljn_peer = _ci_kw
                                         if _ljn_peer is not None:
                                             new_inner_line = (
                                                 " " * _ljn_peer + subline_stripped
@@ -1982,6 +2248,10 @@ def _align_subquery_brackets_pass(lines: List[str]) -> List[str]:
                                                             target_indent,
                                                         )
                                                     )
+                                                    # 递归结果中的旧缩进可能 < 当前层基准（UNION 分支的 from 用了旧 indent），
+                                                    # 用 _ci_kw 兜底确保不低于当前嵌套层的正确缩进
+                                                    if _al_fix is not None and _al_fix < _ci_kw:
+                                                        _al_fix = _ci_kw
                                             elif (
                                                 re.match(
                                                     r"^where\b",
@@ -2024,6 +2294,9 @@ def _align_subquery_brackets_pass(lines: List[str]) -> List[str]:
                                                 if _gx is not None:
                                                     _al_fix = _gx
                                             if _al_fix is not None:
+                                                # 递归结果中的旧缩进可能 < 当前层基准，统一兜底
+                                                if _al_fix < _ci_kw:
+                                                    _al_fix = _ci_kw
                                                 new_inner_line = (
                                                     " " * _al_fix + subline_stripped
                                                 )
@@ -2048,11 +2321,51 @@ def _align_subquery_brackets_pass(lines: List[str]) -> List[str]:
                                         else:
                                             new_inner_line = subline.rstrip("\n")
                                     else:
-                                        new_inner_line = subline.rstrip("\n")
+                                        # 嵌套层非关键字行：如果缩进明显低于当前层基准（递归层旧值），
+                                        # 通过 new_lines 中最近 select 的缩进偏移来纠正
+                                        if _cur_lead < _ci_kw and subline_stripped.startswith(","):
+                                            _ref_new_sel = None
+                                            _ref_old_sel = None
+                                            for _bk in range(len(new_lines) - 1, -1, -1):
+                                                _bks = new_lines[_bk].strip().lower()
+                                                if not _bks or _bks.startswith("--") or _bks.startswith(","):
+                                                    continue
+                                                if _bks.startswith("select"):
+                                                    _ref_new_sel = len(new_lines[_bk]) - len(new_lines[_bk].lstrip())
+                                                    break
+                                                break
+                                            if _ref_new_sel is not None:
+                                                for _bk2 in range(idx - 1, -1, -1):
+                                                    _bk2s = processed_subquery[_bk2].strip().lower()
+                                                    if not _bk2s or _bk2s.startswith("--") or _bk2s.startswith(","):
+                                                        continue
+                                                    if _bk2s.startswith("select"):
+                                                        _ref_old_sel = len(processed_subquery[_bk2]) - len(processed_subquery[_bk2].lstrip())
+                                                        break
+                                                    break
+                                            if _ref_new_sel is not None and _ref_old_sel is not None and _ref_new_sel > _ref_old_sel:
+                                                _shift = _ref_new_sel - _ref_old_sel
+                                                new_inner_line = " " * (_cur_lead + _shift) + subline_stripped
+                                            else:
+                                                new_inner_line = subline.rstrip("\n")
+                                        else:
+                                            new_inner_line = subline.rstrip("\n")
 
                                 if has_newline:
                                     new_inner_line += '\n'
                                 new_lines.append(new_inner_line)
+                                # 行内括号可能改变深度（如 `) as end_time`），追踪修正
+                                _inline_delta = _paren_delta_ignore_strings_sq(subline)
+                                if _inline_delta != 0:
+                                    bracket_depth += _inline_delta
+                                    if _inline_delta > 0:
+                                        _cur_ind = len(new_inner_line.rstrip("\n")) - len(new_inner_line.rstrip("\n").lstrip())
+                                        for _ in range(_inline_delta):
+                                            paren_col_stack.append(_cur_ind)
+                                    elif _inline_delta < 0:
+                                        for _ in range(-_inline_delta):
+                                            if paren_col_stack:
+                                                paren_col_stack.pop()
                             else:
                                 has_nl2 = subline.endswith("\n")
                                 if subline_stripped.startswith("--"):
@@ -2070,6 +2383,17 @@ def _align_subquery_brackets_pass(lines: List[str]) -> List[str]:
                                     new_lines.append(_nl2)
                                 else:
                                     new_lines.append(subline)
+                                # 注释/空行也可能含括号（罕见），统一追踪
+                                _inline_delta2 = _paren_delta_ignore_strings_sq(subline)
+                                if _inline_delta2 != 0:
+                                    bracket_depth += _inline_delta2
+                                    if _inline_delta2 > 0:
+                                        for _ in range(_inline_delta2):
+                                            paren_col_stack.append(target_indent)
+                                    elif _inline_delta2 < 0:
+                                        for _ in range(-_inline_delta2):
+                                            if paren_col_stack:
+                                                paren_col_stack.pop()
 
                     # 最后添加右括号
                     if closing_bracket_line:
@@ -2514,7 +2838,7 @@ def _wrap_paren_indent_union_outer_select(lines: List[str], open_paren_line: int
         if not ps or ps.startswith("--"):
             j -= 1
             continue
-        if not re.match(r"^from\b", ps, re.I):
+        if not re.match(r"^(?:from|(?:(?:left|right|inner|full)(?:\s+outer)?\s+)?(?:cross\s+)?join)\b", ps, re.I):
             return None
         break
     fir = open_paren_line + 1
@@ -2861,7 +3185,8 @@ def align_case_when_columns(lines: List[str]) -> List[str]:
             continue
 
         # 规则 9–12：仅当本行自外层 ``case`` 起 ``case when``/``end`` 配对深度归零，才视为单行 CASE，跳过续行扫描。
-        _prev_open_paren = i > 0 and lines[i - 1].rstrip().endswith("(")
+        _prev_line_s = lines[i - 1].rstrip() if i > 0 else ""
+        _prev_open_paren = _prev_line_s.endswith("(") and _prev_line_s.strip() != "("
         if _prev_open_paren:
             new_lines.append(line)
             i += 1
@@ -2873,11 +3198,14 @@ def align_case_when_columns(lines: List[str]) -> List[str]:
 
         case_col = case_m.start()
         when_col = when_head.start(1)
+        _wcond = _col_first_nonspace_after_first_when_on_line(line)
+        when_cond_col = _wcond if _wcond is not None else when_col
 
         new_lines.append(line)
         i += 1
         # 规则 6–8、13–15：``end`` 与栈顶 ``case`` 左对齐；``when``/``else`` 与栈顶同层 ``when`` 列对齐。
-        stack: List[Tuple[int, int]] = [(case_col, when_col)]
+        # 第三元素 ``when_cond_col``：``when`` 后首个非空字符列，用于多行 WHEN 条件内 and/or/then 续行对齐。
+        stack: List[Tuple[int, int, int]] = [(case_col, when_col, when_cond_col)]
 
         while i < n:
             raw = lines[i]
@@ -2912,14 +3240,57 @@ def align_case_when_columns(lines: List[str]) -> List[str]:
 
             if re.match(r"(?i)^then\b", s):
                 has_nl = raw.endswith("\n")
-                wcol = stack[-1][1]
+                # 多行 WHEN 条件（when 与 then 之间存在 and/or 续行）时，then 对齐到 when 后首字符列；
+                # 单行条件时仍对齐到 when_col。
+                _multiline_when = False
+                for _j in range(i - 1, -1, -1):
+                    _ps = lines[_j].strip()
+                    if not _ps or _ps.startswith('--'):
+                        continue
+                    if re.match(r"^(and|or)\b", _ps, re.I):
+                        _multiline_when = True
+                        break
+                    if re.search(r"(?i)\bwhen\b", _ps):
+                        break
+                wcol = stack[-1][2] if (_multiline_when and stack) else stack[-1][1]
                 new_l = _replace_leading_indent_first_line(raw, wcol)
                 if has_nl and not new_l.endswith("\n"):
                     new_l += "\n"
                 elif not has_nl and new_l.endswith("\n"):
                     new_l = new_l.rstrip("\n")
-                new_lines.append(new_l)
+                # 多行 CASE 中「then value end」同行时，拆为 then value + 独立 end（end 与 case 同列）
+                _th_line0 = new_l.split("\n", 1)[0]
+                _th_rest = re.sub(r'^.*?\bthen\b', '', _th_line0, count=1, flags=re.I)
+                _net_end = len(re.findall(r'\bend\b', _th_rest, re.I)) - len(re.findall(r'\bcase\s+when\b', _th_rest, re.I))
+                if _net_end > 0 and _multiline_when and stack:
+                    _end_m = None
+                    for _em in re.finditer(r'\bend\b', _th_line0, re.I):
+                        _end_m = _em
+                    if _end_m:
+                        _before_end = _th_line0[:_end_m.start()].rstrip()
+                        _after_end = _th_line0[_end_m.end():]
+                        _end_line = " " * stack[-1][0] + "end" + _after_end
+                        new_l_split = _before_end + ("\n" if has_nl else "")
+                        new_lines.append(new_l_split)
+                        new_lines.append(_end_line + ("\n" if has_nl else ""))
+                        stack.pop()
+                        _net_end -= 1
+                        while _net_end > 0 and stack:
+                            stack.pop()
+                            _net_end -= 1
+                    else:
+                        new_lines.append(new_l)
+                        while _net_end > 0 and stack:
+                            stack.pop()
+                            _net_end -= 1
+                else:
+                    new_lines.append(new_l)
+                    while _net_end > 0 and stack:
+                        stack.pop()
+                        _net_end -= 1
                 i += 1
+                if not stack:
+                    break
             elif re.match(r'^when\s+', s, re.IGNORECASE) or re.match(r'^else\b', s, re.IGNORECASE):
                 has_nl = raw.endswith('\n')
                 use_when_col = stack[-1][1]
@@ -2937,10 +3308,31 @@ def align_case_when_columns(lines: List[str]) -> List[str]:
                 ):
                     kw_in = _case_when_keyword_columns(lbw)
                     if kw_in is not None and not _case_when_fully_closed_on_line(lbw, kw_in[0]):
-                        stack.append((kw_in[0], kw_in[1]))
+                        _cc = _col_first_nonspace_after_first_when_on_line(lbw)
+                        stack.append((kw_in[0], kw_in[1], _cc if _cc is not None else kw_in[1]))
                 i += 1
             elif re.match(r"^(and|or)\b", s, re.IGNORECASE):
-                cont = _continuation_col_after_when_above(lines, i)
+                # 若前一行以 and(/or( 打开了未闭合括号组，对齐到该行 and/or 后首非空字符
+                cont = None
+                for _j in range(len(new_lines) - 1, -1, -1):
+                    _ps = new_lines[_j].strip()
+                    if not _ps or _ps.startswith('--'):
+                        continue
+                    _paren_m = re.match(r"^(and|or)\s+\(", _ps, re.I)
+                    if _paren_m:
+                        _pline = new_lines[_j].split("\n", 1)[0]
+                        _kw_m = re.search(r"(?i)\b(and|or)\s+", _pline)
+                        if _kw_m:
+                            _after = _kw_m.end()
+                            while _after < len(_pline) and _pline[_after] in " \t":
+                                _after += 1
+                            if _after < len(_pline):
+                                cont = _after
+                    break
+                if cont is None:
+                    cont = _continuation_col_after_when_above(lines, i)
+                if cont is None and stack:
+                    cont = stack[-1][2]
                 if cont is not None:
                     has_nl = raw.endswith("\n")
                     new_l = _replace_leading_indent_first_line(raw, cont)
@@ -2979,11 +3371,11 @@ def align_case_when_columns(lines: List[str]) -> List[str]:
                     elif not has_nl and new_l.endswith("\n"):
                         new_l = new_l.rstrip("\n")
                     new_lines.append(new_l)
-                    kw = _case_when_keyword_columns(new_l.split("\n", 1)[0])
-                    if kw is not None and not _case_when_fully_closed_on_line(
-                        new_l.split("\n", 1)[0], kw[0]
-                    ):
-                        stack.append((kw[0], kw[1]))
+                    _nl0 = new_l.split("\n", 1)[0]
+                    kw = _case_when_keyword_columns(_nl0)
+                    if kw is not None and not _case_when_fully_closed_on_line(_nl0, kw[0]):
+                        _cc2 = _col_first_nonspace_after_first_when_on_line(_nl0)
+                        stack.append((kw[0], kw[1], _cc2 if _cc2 is not None else kw[1]))
                     i += 1
                     continue
                 new_lines.append(raw)
@@ -3533,6 +3925,112 @@ def split_long_on_conditions(lines: List[str]) -> List[str]:
     return out
 
 
+def split_where_conditions(lines: List[str]) -> List[str]:
+    """将 ``where cond1 and cond2 ...`` 按顶层 ``and``/``or`` 拆成多行。
+
+    仅拆分行首为 ``where``/``having`` 的行；括号/引号内的 ``and``/``or`` 不拆。
+    拆分后第一个谓词留在 ``where``/``having`` 行，后续 ``and``/``or`` 各起新行，
+    缩进与 ``where``/``having`` 行首相同。
+    """
+    if not lines:
+        return lines
+    out: List[str] = []
+    for line in lines:
+        has_nl = line.endswith("\n")
+        raw = line[:-1] if has_nl else line
+        m = re.match(r"^(\s*)(where|having)\s+(.+)$", raw, re.IGNORECASE)
+        if not m:
+            out.append(line)
+            continue
+        indent, kw, rest = m.group(1), m.group(2), m.group(3).strip()
+        frags = _split_top_level_and_or_fragments(rest)
+        if len(frags) < 2:
+            out.append(line)
+            continue
+        suf = "\n" if has_nl else ""
+        out.append(f"{indent}{kw} {frags[0][1]}{suf}")
+        for connector, frag_text in frags[1:]:
+            out.append(f"{indent}{connector} {frag_text}{suf}")
+    return out
+
+
+def _split_top_level_and_or_fragments(expr: str) -> List[Tuple[str, str]]:
+    """在顶层（括号深度 0、不在引号内）按 `` and ``/`` or `` 拆分。
+
+    返回 ``[(connector, fragment), ...]``，第一个元素 connector 为空字符串。
+    """
+    n = len(expr)
+    i = 0
+    parts: List[Tuple[str, str]] = []
+    buf: List[str] = []
+    depth = 0
+    in_sq = False
+    in_dq = False
+    while i < n:
+        ch = expr[i]
+        if in_sq:
+            buf.append(ch)
+            if ch == "'" and i + 1 < n and expr[i + 1] == "'":
+                buf.append(expr[i + 1])
+                i += 2
+                continue
+            if ch == "'":
+                in_sq = False
+            i += 1
+            continue
+        if in_dq:
+            buf.append(ch)
+            if ch == "\\" and i + 1 < n:
+                buf.append(expr[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_dq = False
+            i += 1
+            continue
+        if ch == "'":
+            in_sq = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_dq = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+            i += 1
+            continue
+        if depth == 0:
+            if i + 5 <= n and expr[i : i + 5].lower() == " and ":
+                parts.append(("" if not parts else "and", "".join(buf).strip()))
+                buf = []
+                i += 5
+                continue
+            if i + 4 <= n and expr[i : i + 4].lower() == " or ":
+                parts.append(("" if not parts else "or", "".join(buf).strip()))
+                buf = []
+                i += 4
+                continue
+        buf.append(ch)
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(("" if not parts else "and", tail))
+    if parts and parts[0][0] == "":
+        pass
+    elif parts:
+        parts[0] = ("", parts[0][1])
+    return parts
+
+
 def fix_subquery_on_indent(lines: List[str]) -> List[str]:
     """子查询 `) as alias` 下一行的 ON：与同层 left join / join 首列对齐（不与 `)` 对齐）。"""
     new_lines = []
@@ -3800,6 +4298,30 @@ def _align_field_names_pass(lines: List[str]) -> List[str]:
     return new_lines
 
 
+_KW_MULTI_SPACE_RE = re.compile(
+    r'\b(select|from|where|and|or|on|having|group\s+by|order\s+by|limit|when|then|else)\s{2,}(?=\S)',
+    re.IGNORECASE,
+)
+
+
+def normalize_keyword_spacing(lines: List[str]) -> List[str]:
+    """将 SQL 关键字后的多余空格压缩为单空格（跳过注释行和字符串内部）。"""
+    new_lines: List[str] = []
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith('--'):
+            new_lines.append(line)
+            continue
+        parts = re.split(r"('(?:[^'\\]|\\.)*')", line)
+        rebuilt = []
+        for i, part in enumerate(parts):
+            if i % 2 == 0:
+                part = _KW_MULTI_SPACE_RE.sub(lambda m: m.group(1) + ' ', part)
+            rebuilt.append(part)
+        new_lines.append(''.join(rebuilt))
+    return new_lines
+
+
 def normalize_operator_spacing(lines: List[str]) -> List[str]:
     """标准化运算符空格：所有比较运算符和赋值运算符前后都添加空格
 
@@ -3831,8 +4353,8 @@ def normalize_operator_spacing(lines: List[str]) -> List[str]:
         result = re.sub(r'(?<!<|>|!)\s*=\s*(\S)', r' = \1', result)
 
         # 处理 < 和 >（不是 <>, <=, >= 的一部分）
-        result = re.sub(r'(\w)\s*<\s*(?![>=])', r'\1 < ', result)
-        result = re.sub(r'(\w)\s*>\s*(?![=])', r'\1 > ', result)
+        result = re.sub(r'([\w)])\s*<\s*(?![>=])', r'\1 < ', result)
+        result = re.sub(r'([\w)])\s*>\s*(?![=])', r'\1 > ', result)
 
         new_lines.append(result)
 
@@ -3906,8 +4428,8 @@ def convert_to_leading_comma(lines: List[str]) -> List[str]:
             new_next_line = ' ' * next_indent + ', ' + next_stripped
             if next_has_newline and not new_next_line.endswith('\n'):
                 new_next_line += '\n'
-            new_lines.append(new_next_line)
-            i += 2
+            lines[i + 1] = new_next_line
+            i += 1
             continue
 
         new_lines.append(line)
@@ -3978,6 +4500,8 @@ def _unify_gate_char_span_len_from_pos(lb: str, pos: int) -> int:
 
 def parse_select_field(line: str) -> Tuple[str, int, str, str, int]:
     """解析 SELECT 字段行，返回字段表达式、AS位置、别名、原始行、字段起始位置"""
+    if line.lstrip().startswith('--') or line.lstrip().startswith('/*'):
+        return None, -1, None, line, -1
     matches = list(re.finditer(r'\s+as\s+(\w+)', line, re.IGNORECASE))
     if not matches:
         return None, -1, None, line, -1
@@ -4176,7 +4700,7 @@ def analyze_select_block(lines: List[str], start: int, end: int) -> Dict:
             lb = line.split("\n", 1)[0]
             gate_rel = _field_gate_rel_display_width(lines, start, i, lb)
             gate_abs_end = _field_gate_abs_end_display(lb)
-            tier_len = float(gate_rel) if gate_rel is not None else float(field_len)
+            tier_len = float(field_len)
 
             fields.append({
                 'line_num': i,
@@ -4190,14 +4714,16 @@ def analyze_select_block(lines: List[str], start: int, end: int) -> Dict:
                 'field_start_pos': field_start_pos
             })
 
-    short = [f for f in fields if f['tier_len'] <= SHORT_FIELD_MAX]
-    medium = [f for f in fields if SHORT_FIELD_MAX < f['tier_len'] <= MEDIUM_FIELD_MAX]
-    long = [f for f in fields if f['tier_len'] > MEDIUM_FIELD_MAX]
+    sorted_fields = sorted(fields, key=lambda f: f['tier_len'])
+    groups: List[List[Dict]] = []
+    for f in sorted_fields:
+        if not groups or f['tier_len'] - groups[-1][-1]['tier_len'] > SHORT_FIELD_MAX:
+            groups.append([f])
+        else:
+            groups[-1].append(f)
 
     return {
-        'short': short,
-        'medium': medium,
-        'long': long,
+        'groups': groups,
         'all': fields
     }
 
@@ -4234,6 +4760,16 @@ def align_fields_in_place(lines: List[str], fields: List[Dict], target_col: int,
         spaces_after = len(after_keyword) - len(after_keyword.lstrip())
         field_start_pos = keyword_end_pos + spaces_after
 
+    # 预计算括号深度：深度>0 的行是函数参数续行，不应重置缩进
+    _func_cont_lines: set = set()
+    if fields:
+        _max_ln = max(f['line_num'] for f in fields)
+        _depth = 0
+        for _idx in range(select_start, min(_max_ln + 1, len(new_lines))):
+            if _depth > 0:
+                _func_cont_lines.add(_idx)
+            _depth += _paren_delta_ignore_strings_sq(new_lines[_idx])
+
     for field in fields:
         line_num = field['line_num']
         old_line = new_lines[line_num]
@@ -4243,11 +4779,12 @@ def align_fields_in_place(lines: List[str], fields: List[Dict], target_col: int,
         line_stripped = old_line.lstrip()
 
         if line_stripped.startswith(','):
-            # 使用统一的缩进，与SELECT块第一个字段对齐
-            if field_start_pos is not None:
+            if line_num in _func_cont_lines:
+                indent = old_line[:len(old_line) - len(line_stripped)]
+                prefix = indent + ', '
+            elif field_start_pos is not None:
                 prefix = ' ' * (field_start_pos - 2) + ', '
             else:
-                # 如果无法计算字段位置，保留原始indent
                 indent = old_line[:len(old_line) - len(line_stripped)]
                 prefix = indent + ', '
         elif 'select' in line_stripped.lower()[:10]:
@@ -4270,8 +4807,13 @@ def align_fields_in_place(lines: List[str], fields: List[Dict], target_col: int,
             ),
         )
 
+        trailing_comment = ''
+        cm = re.search(r'\s+--|(?<=\w)--', old_line)
+        if cm:
+            trailing_comment = old_line[cm.start():].rstrip('\n')
+
         has_newline = old_line.endswith('\n')
-        new_line = prefix + field_expr + " " * spaces_needed + "as " + alias
+        new_line = prefix + field_expr + " " * spaces_needed + "as " + alias + trailing_comment
         if has_newline:
             new_line += '\n'
 
@@ -4292,26 +4834,18 @@ def verify_select_alignment(lines: List[str], start: int, end: int) -> bool:
         return len(as_positions) <= 1
 
     is_aligned = True
-    group_as_positions = {}
+    prev_pos = -1
 
-    for group_name in ['short', 'medium', 'long']:
-        group = result[group_name]
+    for group in result['groups']:
         if group:
             as_positions = set(f['as_pos'] for f in group)
             if len(as_positions) > 1:
                 is_aligned = False
             else:
-                group_as_positions[group_name] = list(as_positions)[0]
-
-    if 'short' in group_as_positions and 'medium' in group_as_positions:
-        if group_as_positions['short'] >= group_as_positions['medium']:
-            is_aligned = False
-    if 'medium' in group_as_positions and 'long' in group_as_positions:
-        if group_as_positions['medium'] >= group_as_positions['long']:
-            is_aligned = False
-    if 'short' in group_as_positions and 'long' in group_as_positions:
-        if group_as_positions['short'] >= group_as_positions['long']:
-            is_aligned = False
+                cur_pos = list(as_positions)[0]
+                if prev_pos >= 0 and cur_pos <= prev_pos:
+                    is_aligned = False
+                prev_pos = cur_pos
 
     return is_aligned
 
@@ -4329,6 +4863,76 @@ def parse_create_table_column(line: str) -> Tuple[str, str, str, str]:
         return column_name, data_type, comment_text, line
 
     return None, None, None, line
+
+
+def split_create_table_open_paren(lines: List[str]) -> List[str]:
+    """若 ``create table ... 表名(`` 左括号在行尾，拆到下一行独占，与 ``create`` 行首对齐。"""
+    new_lines: List[str] = []
+    for line in lines:
+        m = re.match(r'^(\s*create\s+table\b.+?)\(\s*$', line, re.IGNORECASE)
+        if m:
+            indent = len(line) - len(line.lstrip())
+            has_nl = line.endswith('\n')
+            suf = '\n' if has_nl else ''
+            new_lines.append(m.group(1).rstrip() + suf)
+            new_lines.append(' ' * indent + '(' + suf)
+        else:
+            new_lines.append(line)
+    return new_lines
+
+
+def split_cte_as_open_paren(lines: List[str]) -> List[str]:
+    """若 ``with name as (`` 或 ``, name as (`` 行尾 ``(`` 与 ``as`` 同行，拆 ``(`` 到下一行独占。"""
+    new_lines: List[str] = []
+    for line in lines:
+        m = re.match(r'^(\s*(?:with\s+\w+|,\s*\w+)\s+as)\s*\(\s*$', line, re.IGNORECASE)
+        if m:
+            indent = len(line) - len(line.lstrip())
+            has_nl = line.endswith('\n')
+            suf = '\n' if has_nl else ''
+            new_lines.append(m.group(1) + suf)
+            new_lines.append(' ' * indent + '(' + suf)
+        else:
+            new_lines.append(line)
+    return new_lines
+
+
+def align_create_table_tail(lines: List[str]) -> List[str]:
+    """将 CREATE TABLE 闭合 ``)`` 之后到 ``;`` 之间的表属性子句与 ``create`` 行首对齐。"""
+    new_lines = lines.copy()
+    i = 0
+    while i < len(new_lines):
+        if re.match(r'^\s*create\s+table\b', new_lines[i], re.IGNORECASE):
+            create_indent = len(new_lines[i]) - len(new_lines[i].lstrip())
+            paren_depth = 0
+            j = i
+            close_line = -1
+            while j < len(new_lines):
+                paren_depth += new_lines[j].count('(') - new_lines[j].count(')')
+                if paren_depth == 0 and j > i:
+                    close_line = j
+                    break
+                j += 1
+            if close_line < 0:
+                i += 1
+                continue
+            k = close_line + 1
+            while k < len(new_lines):
+                stripped = new_lines[k].strip()
+                if not stripped:
+                    k += 1
+                    continue
+                if stripped == ';' or stripped.endswith(';'):
+                    has_nl = new_lines[k].endswith('\n')
+                    new_lines[k] = ' ' * create_indent + stripped + ('\n' if has_nl else '')
+                    break
+                has_nl = new_lines[k].endswith('\n')
+                new_lines[k] = ' ' * create_indent + stripped + ('\n' if has_nl else '')
+                k += 1
+            i = k + 1
+        else:
+            i += 1
+    return new_lines
 
 
 def detect_create_table_blocks(lines: List[str]) -> List[Tuple[int, int, str]]:
@@ -4478,7 +5082,7 @@ def verify_create_table_alignment(lines: List[str], start: int, end: int) -> boo
 
 
 def format_sql_file(input_file: str, verify_only: bool = False,
-                   as_only: bool = False, table_only: bool = False, char_mode: bool = False,
+                   as_only: bool = False, table_only: bool = False, char_mode: bool = True,
                    cjk_width: float = 2.0):
     """格式化 SQL 文件的对齐"""
     global USE_CHAR_MODE, CJK_WIDTH_RATIO
@@ -4507,12 +5111,40 @@ def format_sql_file(input_file: str, verify_only: bool = False,
         print("【预处理】代码规范化")
         print("="*70)
 
+        # 0-pre-a. CREATE TABLE 行尾 ( 拆到下一行独占
+        original_lines = lines.copy()
+        lines = split_create_table_open_paren(lines)
+        paren_split = len(lines) - len(original_lines)
+        if paren_split > 0:
+            print(f"✅ 拆分建表语句行尾 ( 到独立行，新增 {paren_split} 行")
+
+        # 0-pre-a2. CTE with/逗号 name as ( 行尾 ( 拆到独立行
+        original_lines = lines.copy()
+        lines = split_cte_as_open_paren(lines)
+        cte_paren_split = len(lines) - len(original_lines)
+        if cte_paren_split > 0:
+            print(f"✅ 拆分 CTE as ( 行尾 ( 到独立行，新增 {cte_paren_split} 行")
+
+        # 0-pre-b. CREATE TABLE 闭合括号后的表属性子句与 create 行首对齐
+        original_lines = lines.copy()
+        lines = align_create_table_tail(lines)
+        tail_count = sum(1 for i in range(len(lines)) if i < len(original_lines) and lines[i] != original_lines[i])
+        if tail_count > 0:
+            print(f"✅ 对齐 {tail_count} 行建表尾部子句（COMMENT/PARTITIONED/stored）")
+
         # 0. 标准化运算符空格
         original_lines = lines.copy()
         lines = normalize_operator_spacing(lines)
         operator_count = sum(1 for i in range(len(lines)) if i < len(original_lines) and lines[i] != original_lines[i])
         if operator_count > 0:
             print(f"✅ 标准化 {operator_count} 行的运算符空格")
+
+        # 0.1 关键字后多余空格压缩为单空格
+        original_lines = lines.copy()
+        lines = normalize_keyword_spacing(lines)
+        kw_count = sum(1 for i in range(len(lines)) if i < len(original_lines) and lines[i] != original_lines[i])
+        if kw_count > 0:
+            print(f"✅ 压缩 {kw_count} 行关键字后多余空格")
 
         # 1. 修复 select as 错误
         original_lines = lines.copy()
@@ -4567,6 +5199,13 @@ def format_sql_file(input_file: str, verify_only: bool = False,
         comma_convert_count = sum(1 for i in range(len(lines)) if i < len(original_lines) and lines[i] != original_lines[i])
         if comma_convert_count > 0:
             print(f"✅ 转换 {comma_convert_count} 行逗号为前置格式")
+
+        # 2.7 拆分 from/join ( 和 from/join (select ... 到独立行（须在补AS之前）
+        original_lines = lines.copy()
+        lines = split_from_join_open_paren(lines)
+        fj_split = len(lines) - len(original_lines)
+        if fj_split > 0:
+            print(f"✅ 拆分 from/join ( 到独立行，新增 {fj_split} 行")
 
         # 3. 自动补充缺失的AS关键字
         original_lines = lines.copy()
@@ -4709,6 +5348,13 @@ def format_sql_file(input_file: str, verify_only: bool = False,
         if on_and_lines > 0:
             print(f"✅ 拆分过长 ON 条件（按 and），新增 {on_and_lines} 行")
 
+        # 5.9 拆分 where/having 行内的顶层 and/or 为独立行
+        original_lines = lines.copy()
+        lines = split_where_conditions(lines)
+        where_split_extra = len(lines) - len(original_lines)
+        if where_split_extra > 0:
+            print(f"✅ 拆分 WHERE/HAVING 条件（按 and/or），新增 {where_split_extra} 行")
+
         # 6. 对齐 WHERE/JOIN 和 AND/OR/ON
         original_lines = lines.copy()
         lines = align_where_and_clauses(lines)
@@ -4733,6 +5379,13 @@ def format_sql_file(input_file: str, verify_only: bool = False,
         removed_count = original_count - len(lines)
         if removed_count > 0:
             print(f"✅ 删除 {removed_count} 个空行")
+
+        # 7.5 函数参数折行对齐（续行逗号对齐到函数名末字符列，非逗号对齐到首参数列）
+        original_lines = lines.copy()
+        lines = align_function_arg_continuations(lines)
+        func_arg_count = sum(1 for i in range(len(lines)) if i < len(original_lines) and lines[i] != original_lines[i])
+        if func_arg_count > 0:
+            print(f"✅ 对齐 {func_arg_count} 行函数参数续行")
 
         print(f"\n{'='*70}\n")
 
@@ -4792,13 +5445,11 @@ def format_sql_file(input_file: str, verify_only: bool = False,
                         )
                         print(f"    ✅ 已完成对齐")
             else:
-                for group_name, group_label in [('short', '短字段'), ('medium', '中字段'), ('long', '长字段')]:
-                    group = result[group_name]
-
+                for gi, group in enumerate(result['groups']):
                     if not group:
                         continue
 
-                    print(f"\n  {group_label}组: {len(group)} 个字段")
+                    print(f"\n  分组 {gi+1}: {len(group)} 个字段")
 
                     current_positions = set(f['as_pos'] for f in group)
                     target_col = calculate_target_as_column(group)

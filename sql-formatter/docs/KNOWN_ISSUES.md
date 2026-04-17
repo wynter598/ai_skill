@@ -1,5 +1,32 @@
 # SQL对齐工具已知问题和解决方案
 
+## Issue #7: UNION 容器子查询内 `from`/`select`/逗号行缩进被降级到外层（v3.1.3 修复）
+
+### 现象
+1. 包含 `UNION ALL` 链的大子查询（如 CTE 内 `from (...union all...union all...)`），第二/三分支的 `from`、`select`、逗号字段行缩进被降到外层 indent（如 indent=6 应为 12；子查询内 `select` indent=12 应为 18）。
+2. 嵌套层 `) as alias` 与对应 `(` 不在同一列。
+
+### 根因
+`_align_subquery_brackets_pass` 的重写循环中，`bracket_depth` 仅通过 `^\s*\(` / `^\s*\)` 行首模式追踪，忽略了行内表达式级括号（如 `nvl(lead(...), cast(...)) as end_time` 中的 `)` 出现在行首）。这导致：
+1. 表达式级 `)` 被误判为子查询闭合，`bracket_depth` 提前降为 0 甚至负数。
+2. 本应在 `bracket_depth > 0`（嵌套层保持不变）的行被错误地在 `bracket_depth == 0`（第一层关键字调整）中处理，使用了错误的 `relative_indent` 基准。
+3. 嵌套层的 `from + (` 子查询中，`(` 和 `select` 的缩进基于递归层旧的 `base_indent`，未被外层重写循环纠正。
+
+### 解决方案
+1. **行内括号深度追踪**：在重写循环中，对非 `^\s*\(` / `^\s*\)` 的行处理完后，用 `_paren_delta_ignore_strings_sq` 计算行内括号变化量并更新 `bracket_depth` 和 `paren_col_stack`，确保嵌套深度追踪准确。
+2. **嵌套层 `(` 跟随 `from` 对齐**：`bracket_depth > 0` 时，若 `(` 独占一行且前一行（`new_lines[-1]`）是已调整的独占 `from`/`join`，则 `(` 缩进与 `from` 同列，而非保留递归层旧值。
+3. **嵌套层 `select` 从 `new_lines` 取 `(` 缩进**：`(` 后 `select` 的 `_opc` 从 `new_lines[-1]` 取（已调整值），而非 `processed_subquery[idx-1]`（旧值）。
+4. **关键字 `_al_fix` 兜底 `_ci_kw`**：嵌套层 `from`/`union`/`select` 等关键字的缩进值（`_al_fix`）若 < `_ci_kw`（当前层基准），强制使用 `_ci_kw`，避免递归层旧值泄露。
+5. **逗号字段行偏移纠正**：嵌套层中缩进 < `_ci_kw` 的逗号行，通过 `new_lines` 中最近 `select` 与 `processed_subquery` 中对应 `select` 的缩进差（`_shift`）来纠正。
+6. **主扫描 `from`/`join` 纠正**（辅助）：`_from_join_only` 分支在递归层中从 `new_lines` 回溯找 `select` 缩进作为 `base_indent` 纠正参照。
+
+### 影响范围
+- 所有包含 `UNION ALL` 链的嵌套子查询
+- 多层嵌套的 `from (select ... from (select ... ) as a) as b` 结构
+- CTE 内的复杂子查询缩进
+
+---
+
 ## Issue #6: `) alias where condition` 同行时别名未加 AS 且 WHERE 未换行 + 缩进级联错误（v3.1.2 修复）
 
 ### 现象

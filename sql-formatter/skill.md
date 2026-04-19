@@ -136,8 +136,12 @@ python3 sql_aligner.py file.sql --table-only
 ```
 
 **工作流程建议**：
-1. **手动格式化**：按照本文档规范进行关键字小写、逗号前置等基础格式化
-2. **自动对齐**：使用 `sql_aligner.py` 自动对齐 AS 和建表语句
+1. **手动格式化（最小职责）**：仅做以下操作——
+   - 关键字/函数名小写
+   - 补充缺失的 `as` 关键字（表别名、列别名）
+   - `on` 换行、`from/join (` 拆行等结构规则
+   - **严禁**：拆分原文单行表达式为多行（§2.9）、删除非空白字符
+2. **自动对齐**：使用 `sql_aligner.py` 自动处理逗号前置转换、AS 对齐、建表语句对齐、子查询括号缩进、CASE WHEN 对齐等
 3. **验证检查**：使用 `--verify-only` 参数验证对齐是否符合规范
 4. **人工复查**：确认逻辑未被修改，对齐效果符合预期
 
@@ -597,6 +601,48 @@ and c.short                          = d.val  -- 违反单空格规则
 
 **注意**：注释也算作字符，包含注释的行不可删除或换行
 
+#### 2.9 保持原有换行结构（MUST）
+
+**规则**：格式化**只调整空白字符**（缩进、空格），**不创造新的换行**来拆分原文中的单行表达式。
+
+**禁止拆行的场景**：
+- **函数调用参数**：`date_sub(from_unixtime(unix_timestamp(...), 'yyyy-MM-dd'), 179)` 等行内函数嵌套，禁止将参数拆为多行
+- **括号内条件表达式**：`and (a.col != 'X' or a.col is null)` 等行内括号条件，禁止将括号内容拆为多行
+- **CASE WHEN 内部条件**：`when (provider = 'A' and tag = 'D') or (provider rlike 'B' and code = '22') then '...'` 等单行 WHEN 条件，禁止将条件内的每个括号组拆为多行
+
+**唯一例外**（允许拆行的场景）：
+1. §2.3 rule 5：WHEN 条件字符数 > 100 时，将 THEN 换行（仅拆 THEN，不拆条件内部）
+2. 逗号前置转换：行尾逗号转为下一行行首逗号（必要的换行）
+3. §4.2 rule 1：`from/join (` 拆为 `from/join` + 独占行 `(`（子查询括号规则）
+4. §2.4 rule 2：`join ... on ...` 同行拆为两行（ON 换行规则）
+
+**原文已跨行**的结构保持跨行，仅调整缩进对齐。
+
+**核心原则**：如果原文中一个表达式在一行内，格式化后它仍应在一行内。手动格式化步骤**严禁自行判断"行太长需要拆分"**——行长不是格式化的关注点，`sql_aligner.py` 不会拆分行内表达式，手动步骤也不应拆分。
+
+```sql
+-- ❌ 禁止：将单行函数调用拆为多行
+and col >= date_sub(
+                    from_unixtime(
+                                  unix_timestamp('${p_date}', 'yyyyMMdd')
+                                , 'yyyy-MM-dd'
+                                 )
+                  , 179
+                   )
+
+-- ✅ 正确：保持原有单行结构
+and col >= date_sub(from_unixtime(unix_timestamp('${p_date}', 'yyyyMMdd'), 'yyyy-MM-dd'), 179)
+
+-- ❌ 禁止：将单行括号条件拆为多行
+and (
+     a.ivr_intention != 'AVM'
+     or a.ivr_intention is null
+    )
+
+-- ✅ 正确：保持原有单行结构
+and (a.ivr_intention != 'AVM' or a.ivr_intention is null)
+```
+
 ### 三、关键字和命名规范
 
 #### 3.1 SQL 关键字小写
@@ -633,24 +679,27 @@ and c.short                          = d.val  -- 违反单空格规则
 - 使用 CTE 优于嵌套子查询
 - CTE 名称有意义，每个 CTE 之间空一行
 - CTE 内部遵循所有格式规范
+- **`with` 与第一个 CTE 名称必须在同一行**（MUST）：禁止将 `with` 单独成行、CTE 名称另起一行
+- **CTE 的 `(` 遵循 §4.2 子查询规则**（MUST）：`(` 独占一行，与 `with` / `, cte_name as` 定义行的起始列垂直对齐；CTE body 缩进 = `(` 所在列 + 6 个空格（与 §4.2 rule 3 一致）
+- **后续 CTE** 以 `, cte_name as` 开头，逗号前置，`(` 同样独占一行
 
 ```sql
 -- ✅ 正确示例
-with user_orders as (
-    select user_id
-         , count(*) as order_count
-         , sum(amount) as total_amount
-    from order_info
-    where order_date >= '2024-01-01'
-    group by user_id
-),
-
-active_users as (
-    select user_id
-    from user_info
-    where status = 1
+with user_orders as
+(
+      select user_id
+           , count(*) as order_count
+           , sum(amount) as total_amount
+      from order_info
+      where order_date >= '2024-01-01'
+      group by user_id
 )
-
+, active_users as
+(
+      select user_id
+      from user_info
+      where status = 1
+)
 select u.user_id
      , u.user_name
      , coalesce(uo.order_count, 0) as order_count
@@ -661,6 +710,15 @@ on au.user_id = u.user_id
 left join user_orders as uo
 on u.user_id = uo.user_id
 ;
+
+-- ❌ 错误示例1：with 单独成行
+with
+  user_orders as (        -- 错误！with 与 CTE 名称分行
+    select user_id ...
+
+-- ❌ 错误示例2：( 与 as 同行、缩进仅 4 格
+with user_orders as (     -- 错误！( 未独占一行
+    select user_id ...    -- 错误！缩进仅 4 格，应为 6 格
 ```
 
 #### 4.2 子查询格式规范
@@ -826,21 +884,23 @@ from table_name
    - JOIN 的关联关系
    - GROUP BY 的聚合维度
    - 子查询的数据来源和加工逻辑
-3. **执行格式化**：
+3. **执行手动格式化**（最小职责，详见工具说明「工作流程建议」）：
    - 调整关键字大小写（SQL 关键字小写，函数名小写）
-   - 应用逗号前置规则
-   - 字段首字母垂直对齐
-   - 列别名垂直对齐（整块闸门或按 `tier_len` 分级；以 `sql_aligner.py` 为准）
-     - **关键**：必须对每个SELECT语句（包括主查询、每个子查询、每个CTE）独立执行 §2.2 规则
-     - **关键**：同组内 AS 必须精确垂直对齐，以工具显示宽度与闸门 ref 为准，不可目测手填空格
-     - **关键**：格式化完成后必须验证同组内所有AS是否在同一列位置
-   - CASE WHEN 对齐
-   - JOIN/WHERE 条件对齐
-   - 子查询格式（左右括号单独行，6 空格缩进，`from` 与 `(` 不能同行）
-     - **子查询内部必须严格遵循2.2节分级对齐规则**
-   - 添加必要的空格（逗号后空格）
+   - 补充缺失的 `as`（表别名、列别名）
+   - `on` 换行（§2.4 rule 2）、`from/join (` 拆行（§4.2 rule 1）
    - 删除空行（注释行保留）
    - **保持单独行注释的位置不变**（不可移到行尾）
+   - **严禁拆分原文单行表达式为多行**（§2.9）
+   - **严禁删除非空白字符**（逗号、括号、关键字等）
+3.5. **运行 `sql_aligner.py` 自动处理**（以下由工具完成，严禁手动调整）：
+   - 逗号前置转换
+   - 字段首字母垂直对齐
+   - 列别名 AS 垂直对齐（整块闸门或按 `tier_len` 分级）
+     - **关键**：必须对每个SELECT语句（包括主查询、每个子查询、每个CTE）独立执行 §2.2 规则
+   - CASE WHEN 对齐
+   - 子查询括号对齐与缩进（6 空格）
+   - 建表语句对齐
+   - 运算符空格标准化
 4. **逻辑验证**（必做）：
    - 逐行对比格式化前后的逻辑结构
    - 确认 WHERE 条件未被修改
@@ -852,6 +912,12 @@ from table_name
    - 方法：计算每个AS关键字在行中的列位置，确保同组内位置相同
    - 如发现未对齐，必须重新调整直到完全对齐
 4.6. **自检与验证**（必做）：
+   - **逗号完整性校验**（最高优先级）：格式化后，逐个检查每个 SELECT / GROUP BY 列表：
+     - 除首字段外，**每一行必须以 `, ` 开头**（逗号 + 空格 + 字段内容）
+     - 若发现有字段行缺少前导逗号，**立即补回**——逗号是非空白字符，删除逗号**等同违反黑名单硬约束**
+     - 特别注意逗号前置转换后、字符串字面量字段（如 `,'JIUSI_ORDER_PAYOUT'`）是否保留了前导逗号
+   - **换行结构校验**：对比原文件，确认没有将原文单行表达式拆为多行（§2.9）
+     - 重点检查：函数调用、括号条件、CASE WHEN 条件是否被不当拆分
    - **注释内容校验**：逐段对比原文件与格式化后的文件，确保注释文本（去掉行首缩进后）逐字符一致
      - 方法：提取所有注释行，去除行首空白后，对比原文件和格式化后文件是否完全相同
      - 若发现注释文本被修改，立即回退并报告错误

@@ -1563,18 +1563,23 @@ def _align_subquery_brackets_pass(lines: List[str]) -> List[str]:
 
                         # 检测右括号（可能带表别名）
                         if re.match(r'^\s*\)\s*\w*', inner_line):
-                            bracket_depth -= 1
-                            if bracket_depth == 0:
-                                # 保存右括号行，稍后处理
+                            _line_open = inner_stripped.count('(')
+                            _line_close = inner_stripped.count(')')
+                            bracket_depth += _line_open - _line_close
+                            if bracket_depth <= 0:
                                 closing_bracket_line = inner_line
+                                bracket_depth = max(bracket_depth, 0)
                                 i += 1
                                 break
+                            subquery_lines.append(inner_line)
+                            i += 1
+                            continue
 
                         # 检测内嵌的左括号
                         _depth_before = bracket_depth
                         if '(' in inner_stripped:
                             bracket_depth += inner_stripped.count('(')
-                        if ')' in inner_stripped and not re.match(r'^\s*\)\s*\w*', inner_line):
+                        if ')' in inner_stripped:
                             bracket_depth -= inner_stripped.count(')')
 
                         if bracket_depth <= 0 and _depth_before > 0:
@@ -1786,12 +1791,10 @@ def _align_subquery_brackets_pass(lines: List[str]) -> List[str]:
                                 )
                                 bracket_depth += 1
                                 continue
-                            elif re.match(r'^\s*\)', subline):
+                            elif re.match(r'^\s*\)[^)]*$', subline):
                                 _popped_col = paren_col_stack.pop() if paren_col_stack else base_indent
                                 bracket_depth -= 1
                                 has_newline = subline.endswith('\n')
-                                # 右括号：与对应左括号同列；外层由 closing_bracket_line 单独处理，
-                                # 此处仅涉及内容内部嵌套子查询的 `)` — 用 _popped_col 而非 base_indent
                                 if bracket_depth == 0:
                                     new_inner_line = ' ' * _popped_col + subline_stripped
                                 else:
@@ -3268,12 +3271,6 @@ def align_case_when_columns(lines: List[str]) -> List[str]:
             continue
 
         # 规则 9–12：仅当本行自外层 ``case`` 起 ``case when``/``end`` 配对深度归零，才视为单行 CASE，跳过续行扫描。
-        _prev_line_s = lines[i - 1].rstrip() if i > 0 else ""
-        _prev_open_paren = _prev_line_s.endswith("(") and _prev_line_s.strip() != "("
-        if _prev_open_paren:
-            new_lines.append(line)
-            i += 1
-            continue
         if _case_when_fully_closed_on_line(lb0, case_m.start()):
             new_lines.append(line)
             i += 1
@@ -3471,7 +3468,14 @@ def align_case_when_columns(lines: List[str]) -> List[str]:
                 i += 1
             else:
                 new_lines.append(raw)
+                _line0 = raw.split("\n", 1)[0]
+                _net_end = len(re.findall(r'\bend\b', _line0, re.I)) - len(re.findall(r'\bcase\b', _line0, re.I))
+                while _net_end > 0 and stack:
+                    stack.pop()
+                    _net_end -= 1
                 i += 1
+                if not stack:
+                    break
 
     return new_lines
 
@@ -3969,6 +3973,228 @@ def split_inline_join_on_lines(lines: List[str]) -> List[str]:
         if not changed:
             break
     return buf
+
+
+def _find_spaced_keyword_top_level(text: str, word: str, lo: int = 0, hi: Optional[int] = None) -> int:
+    """在 ``text[lo:hi]`` 中找首个圆括号深度 0、且为 `` {word} ``（两侧空格）的匹配起点；找不到返回 ``-1``。"""
+    hi = hi if hi is not None else len(text)
+    needle = f" {word} "
+    nl = needle.lower()
+    depth = 0
+    in_sq = False
+    i = lo
+    while i < hi:
+        ch = text[i]
+        if in_sq:
+            if ch == "'" and i + 1 < hi and text[i + 1] == "'":
+                i += 2
+                continue
+            if ch == "'":
+                in_sq = False
+            i += 1
+            continue
+        if ch == "'":
+            in_sq = True
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0 and i + len(needle) <= hi and text[i : i + len(needle)].lower() == nl:
+            return i
+        i += 1
+    return -1
+
+
+def _split_commas_top_level(segment: str) -> List[str]:
+    """在圆括号深度 0、单引号串外，按逗号拆分 ``segment``。"""
+    parts: List[str] = []
+    buf: List[str] = []
+    depth = 0
+    in_sq = False
+    i = 0
+    n = len(segment)
+    while i < n:
+        ch = segment[i]
+        if in_sq:
+            buf.append(ch)
+            if ch == "'" and i + 1 < n and segment[i + 1] == "'":
+                buf.append(segment[i + 1])
+                i += 2
+                continue
+            if ch == "'":
+                in_sq = False
+            i += 1
+            continue
+        if ch == "'":
+            in_sq = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "," and depth == 0:
+            parts.append("".join(buf).strip())
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def split_dense_select_list_same_line(lines: List[str]) -> List[str]:
+    """将单行 ``select`` 多列 ``… , … from … [where …]`` 拆成多行（行尾逗号），供 ``convert_to_leading_comma`` 收敛为句首逗号。
+
+    仅处理行首为 ``select`` 且同层含 `` from `` 的整行；``insert … select`` 等同行的 ``select`` 不在行首则跳过。
+    """
+    out: List[str] = []
+    for line in lines:
+        has_nl = line.endswith("\n")
+        raw = line[:-1] if has_nl else line
+        if raw.lstrip().startswith("--"):
+            out.append(line)
+            continue
+        m = re.match(r"^(\s*)select\s+(.+)$", raw, re.IGNORECASE)
+        if not m:
+            out.append(line)
+            continue
+        indent, tail = m.group(1), m.group(2)
+        from_i = _find_spaced_keyword_top_level(tail, "from", 0, len(tail))
+        if from_i < 0:
+            out.append(line)
+            continue
+        list_seg = tail[:from_i].rstrip()
+        from_rest = tail[from_i:].lstrip()
+        if not from_rest.lower().startswith("from"):
+            out.append(line)
+            continue
+        fields = _split_commas_top_level(list_seg)
+        if len(fields) < 2:
+            out.append(line)
+            continue
+        fs = len(indent) + len("select ")
+        suf = "\n" if has_nl else ""
+        out.append(indent + "select " + fields[0] + "," + suf)
+        for fld in fields[1:-1]:
+            out.append(" " * (fs - 2) + fld + "," + suf)
+        # 最后一列不得带行尾逗号，否则 ``convert_to_leading_comma`` 会把逗号挪到下一行 ``from`` 前
+        out.append(" " * (fs - 2) + fields[-1] + suf)
+        rest = from_rest
+        wh_i = _find_spaced_keyword_top_level(rest, "where", 0, len(rest))
+        if wh_i >= 0:
+            from_line = indent + rest[:wh_i].rstrip()
+            wh_tail = rest[wh_i:].lstrip()
+            if wh_tail.lower().startswith("where"):
+                out.append(from_line + suf)
+                out.append(indent + wh_tail + suf)
+            else:
+                out.append(indent + rest + suf)
+        else:
+            out.append(indent + rest + suf)
+    return out
+
+
+def merge_lonely_on_with_next_line(lines: List[str]) -> List[str]:
+    """``on`` 独占一行时下一行接条件：合并为 ``on 条件``（``on`` 后恰有一空格），便于 ``align_where_and_clauses`` 识别。"""
+    if not lines:
+        return lines
+    out: List[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        raw0 = lines[i].split("\n", 1)[0]
+        if raw0.strip().lower() != "on":
+            out.append(lines[i])
+            i += 1
+            continue
+        j = _next_meaningful_line_index(lines, i + 1)
+        if j is None:
+            out.append(lines[i])
+            i += 1
+            continue
+        if any(lines[k].strip().startswith("--") for k in range(i + 1, j)):
+            out.append(lines[i])
+            i += 1
+            continue
+        nst = lines[j].strip().lower()
+        if re.match(
+            r"^(left\s+(?:outer\s+)?join|right\s+(?:outer\s+)?join|inner\s+join|cross\s+join|"
+            r"full\s+(?:outer\s+)?join|join|where|group\s+by|order\s+by|limit|union|from|on)\b",
+            nst,
+            re.I,
+        ):
+            out.append(lines[i])
+            i += 1
+            continue
+        lead = raw0[: len(raw0) - len(raw0.lstrip())]
+        has_nl = lines[i].endswith("\n") or lines[j].endswith("\n")
+        merged = lead + "on " + lines[j].strip()
+        if has_nl:
+            merged += "\n"
+        for k in range(i + 1, j):
+            out.append(lines[k])
+        out.append(merged)
+        i = j + 1
+    return out
+
+
+def merge_lonely_where_having_with_next_line(lines: List[str]) -> List[str]:
+    """``where``/``having`` 独占一行且下一行即谓词（无中间注释）时合并为一行，避免续行缩进未被对齐。"""
+    if not lines:
+        return lines
+    out: List[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        raw0 = lines[i].split("\n", 1)[0]
+        m_kw = re.match(r"^(\s*)(where|having)\s*$", raw0, re.IGNORECASE)
+        if not m_kw:
+            out.append(lines[i])
+            i += 1
+            continue
+        j = _next_meaningful_line_index(lines, i + 1)
+        if j is None:
+            out.append(lines[i])
+            i += 1
+            continue
+        if any(lines[k].strip().startswith("--") for k in range(i + 1, j)):
+            out.append(lines[i])
+            i += 1
+            continue
+        nst = lines[j].strip().lower()
+        if re.match(
+            r"^(select|from|where|having|group\s+by|order\s+by|limit|union|"
+            r"left\s+|right\s+|inner\s+|full\s+|cross\s+|join)\b",
+            nst,
+            re.I,
+        ):
+            out.append(lines[i])
+            i += 1
+            continue
+        lead = m_kw.group(1)
+        kw = m_kw.group(2).lower()
+        has_nl = lines[i].endswith("\n") or lines[j].endswith("\n")
+        merged = f"{lead}{kw} {lines[j].strip()}"
+        if has_nl:
+            merged += "\n"
+        for k in range(i + 1, j):
+            out.append(lines[k])
+        out.append(merged)
+        i = j + 1
+    return out
 
 
 def _split_top_level_and_fragments(expr: str) -> List[str]:
@@ -5535,6 +5761,12 @@ def format_sql_file(input_file: str, verify_only: bool = False,
         if fj_split > 0:
             print(f"✅ 拆分 from/join ( 到独立行，新增 {fj_split} 行")
 
+        # 2.65 单行 ``select a, b from … [where …]`` 拆行（行尾逗号），否则 ``convert_to_leading_comma`` 无法处理选列内逗号
+        original_lines = lines.copy()
+        lines = split_dense_select_list_same_line(lines)
+        if lines != original_lines:
+            print("✅ 拆分单行 select 多列 + from/where，便于句首逗号")
+
         # 2.7 转换逗号后置为逗号前置
         original_lines = lines.copy()
         lines = convert_to_leading_comma(lines)
@@ -5570,6 +5802,16 @@ def format_sql_file(input_file: str, verify_only: bool = False,
         pre_split_extra = len(lines) - len(original_lines)
         if pre_split_extra > 0:
             print(f"✅ 预拆分 ) alias on/where，新增 {pre_split_extra} 行（为括号对齐做准备）")
+
+        # 3.021 ``on`` / ``where`` 独占一行时合并下一行条件，避免 ON 续行与 where 谓词缩进错位
+        original_lines = lines.copy()
+        lines = merge_lonely_on_with_next_line(lines)
+        if lines != original_lines:
+            print("✅ 合并独占一行的 on 与下一行条件")
+        original_lines = lines.copy()
+        lines = merge_lonely_where_having_with_next_line(lines)
+        if lines != original_lines:
+            print("✅ 合并独占一行的 where/having 与下一行谓词")
 
         # 3. 对齐子查询括号（必须在字段名对齐之前）
         original_lines = lines.copy()
